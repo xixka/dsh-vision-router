@@ -394,6 +394,6 @@ export async function applySessionVisionPolicyUpdate(
     policy,
     updateRevision: policy.updateRevision,
     updateOrigin: policy.updateOrigin,
-    persistence: { kind: 'degraded', reason: 'session-policy-store-has-no-durable-update-seam' },
+    persistence: { kind: 'degraded' as const, reason: 'session-policy-store-has-no-durable-update-seam' },
   })
 }
