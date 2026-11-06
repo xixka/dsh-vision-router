@@ -21,6 +21,7 @@ const ORIGIN_SELECTION = { provider: 'deepseek-official', model: 'deepseek-v4-pr
 function harness(config = {}) {
   const handlers = new Map()
   const inboxes = new WeakMap()
+  const deferredSelections = new WeakMap()
   const registered = new Set(config.adapters ?? ['deepseek-official', 'hostvision', 'hostvision-b', 'third-party'])
   const log = { select: [], warnings: [], deepToolActivations: 0, order: [] }
   const durable = config.durableLeases ?? new Map()
@@ -85,16 +86,31 @@ function harness(config = {}) {
           // Match real RC1 AgentModel.select: an already recorded identical
           // provider/model is a no-op, not a new accepted user intent.
           if (record.committed?.provider === next.provider && record.committed?.model === next.model) return
+          log.order.push('select')
           log.select.push({ ...next })
           record.value = { ...next }
           record.committed = { ...next }
-          emit('session/event', session, { type: 'model/selection', data: { ...next } })
-          if (config.afterSelectEmit) config.afterSelectEmit(result)
+          const event = { type: 'model/selection', data: { ...next } }
+          if (config.deferSelectEvents) {
+            // Async-Host modeling: the model/selection event fires later than
+            // the select() call, so the exact-match correlation record stays
+            // live across the window.
+            const queue = deferredSelections.get(session) ?? []
+            queue.push(event)
+            deferredSelections.set(session, queue)
+            return
+          }
+          emit('session/event', session, event)
         },
       },
     }
     inboxes.set(session, { 'next-turn': [], 'next-step': [] })
     return result
+  }
+  const flushSelections = (agent) => {
+    const queue = deferredSelections.get(agent.session) ?? []
+    deferredSelections.set(agent.session, [])
+    for (const event of queue) emit('session/event', agent.session, event)
   }
   function insert(agent, message, lane = 'next-turn') {
     activeAppend = true
@@ -123,7 +139,7 @@ function harness(config = {}) {
     return { model: agent.model.current(), messages: copy }
   }
   return {
-    agent, insert, run, done, claim, emit, log, coordinator, durable,
+    agent, insert, run, done, claim, emit, flushSelections, log, coordinator, durable,
     configure(next) { if ('routing' in next) routing = next.routing; if ('reverse' in next) reverse = next.reverse; if ('tool' in next) tool = next.tool },
     removeAdapter: (provider) => registered.delete(provider),
   }
@@ -156,9 +172,12 @@ test('the route lease is saved with the full original selection before the model
   assert.equal(lease.sessionRevision, 12)
   assert.equal(lease.pluginGeneration, 'gen-9')
   assert.equal(lease.executed, true, 'the claimed request header marks the lease executed')
-  // The durable save precedes the host model selection: a crash between the
-  // two still leaves a recoverable original selection.
-  assert.ok(t.log.order.indexOf('save:session-1') === 0, `save must precede select; order=${t.log.order.join(',')}`)
+  // The durable save precedes the host model selection (the first store op for
+  // this session is the recovery load, not a write): a crash between the two
+  // still leaves a recoverable original selection.
+  const saveAt = t.log.order.indexOf('save:session-1')
+  const selectAt = t.log.order.indexOf('select')
+  assert.ok(saveAt >= 0 && selectAt > saveAt, `save must precede select; order=${t.log.order.join(',')}`)
   assert.deepEqual(t.durable.get('session-1'), lease)
 })
 
@@ -253,15 +272,20 @@ test('manual model changes are never overridden by stale DVR restoration state',
 })
 
 test('a foreign selection inside the internal select window is not swallowed by the correlation lock', () => {
+  // Async-Host modeling: the image-turn commit's model/selection event has
+  // not fired yet, so the exact-match correlation record is still live when a
+  // foreign user selection commits. Flushing in commit order proves the
+  // internal event is ignored ONLY because it matches the record, while the
+  // foreign selection cancels the lease instead of being swallowed.
   const foreign = { provider: 'third-party', model: 'foreign' }
-  const t = harness({
-    afterSelectEmit: (agent) => {
-      t.emit('session/event', agent.session, { type: 'model/selection', data: { ...foreign } })
-    },
-  })
+  const t = harness({ deferSelectEvents: true })
   const agent = t.agent()
   t.insert(agent, image())
   t.run(agent)
+  t.claim(agent)
+  assert.ok(t.coordinator.routeLeaseOf(agent), 'the lease survives while its internal commit is still pending')
+  agent.model.select(foreign)
+  t.flushSelections(agent)
   assert.deepEqual(agent.model.current(), foreign, 'the foreign selection wins over the internal image-turn commit')
   assert.equal(t.coordinator.routeLeaseOf(agent), undefined, 'the lease is canceled, not silently kept')
   t.insert(agent, text())
@@ -274,6 +298,10 @@ test('effort-only external selection on the leased route never closes DVR owners
   const agent = t.agent()
   t.insert(agent, image())
   t.run(agent)
+  t.claim(agent)
+  // An RC1 AgentModel.select with an identical provider/model is a no-op, so
+  // an effort-only commit reaches DVR only as a re-committed durable selection
+  // (for example a resumed Session re-consuming its pending modelSelection).
   t.emit('session/event', agent.session, {
     type: 'model/selection',
     data: { provider: 'hostvision', model: 'vision-pro', reasoningEffort: 'low' },
@@ -292,6 +320,10 @@ test('/vision off revokes a not-yet-executed lease and restores the original cha
   assert.equal(t.coordinator.revokePendingRouteLease(agent), true)
   assert.deepEqual(agent.model.current(), ORIGIN_SELECTION)
   assert.equal(t.durable.has('session-1'), false)
+  // /vision off also closes the session's auto-routing at the composition
+  // boundary (plan §3.1: off governs the next prompt assembly), so the still
+  // queued image turn must not open a fresh lease for the chat model.
+  t.configure({ routing: false })
   t.insert(agent, text())
   t.done(agent)
   assert.deepEqual(t.claim(agent).model, ORIGIN_SELECTION)

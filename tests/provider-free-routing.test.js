@@ -19,10 +19,12 @@ const ORIGIN_SELECTION = { provider: 'deepseek-official', model: 'deepseek-v4-pr
 function harness(config = {}) {
   const handlers = new Map()
   const inboxes = new WeakMap()
+  const deferredSelections = new WeakMap()
   const durable = config.durable ?? new Map()
   const log = { select: [], warnings: [], order: [] }
   const registered = new Set(config.adapters ?? ['deepseek-official', 'hostvision', 'third-party'])
   let agentCounter = 0
+  let routing = config.routing ?? true
   const leaseStore = {
     load(id) { log.order.push(`load:${id}`); return durable.get(id) },
     save(id, lease) { log.order.push(`save:${id}`); durable.set(id, lease) },
@@ -41,7 +43,7 @@ function harness(config = {}) {
     logger: { warn(...args) { log.warnings.push(args) }, debug() {} },
   }
   const coordinator = installPreStepModelRouting(ctx, {
-    routingEnabled: () => config.routing ?? true,
+    routingEnabled: () => routing,
     reverseRoutingEnabled: () => config.reverse ?? true,
     routingPairs: () => [{ provider: 'hostvision', model: 'vision-pro' }],
     wrapperRoute: () => undefined,
@@ -62,6 +64,9 @@ function harness(config = {}) {
   const emit = (event, ...args) => {
     for (const cb of handlers.get(event) ?? []) cb(...args)
   }
+  // The durable Session identity is harness-level configuration, never part
+  // of the model selection: a ModelSelection carries only provider, model and
+  // an optional reasoning effort.
   function agent(initial = ORIGIN_SELECTION) {
     const session = { id: config.sessionId ?? `session-${++agentCounter}` }
     const record = { value: { ...initial }, committed: undefined }
@@ -75,13 +80,27 @@ function harness(config = {}) {
           log.select.push({ ...next })
           record.value = { ...next }
           record.committed = { ...next }
-          emit('session/event', session, { type: 'model/selection', data: { ...next } })
-          if (config.afterSelectEmit) config.afterSelectEmit(handle)
+          const event = { type: 'model/selection', data: { ...next } }
+          if (config.deferSelectEvents) {
+            // Async-Host modeling: the model/selection event fires later than
+            // the select() call, so the routing module's exact-match
+            // correlation record stays live across the window.
+            const queue = deferredSelections.get(session) ?? []
+            queue.push(event)
+            deferredSelections.set(session, queue)
+            return
+          }
+          emit('session/event', session, event)
         },
       },
     }
     inboxes.set(session, { 'next-turn': [], 'next-step': [] })
     return handle
+  }
+  const flushSelections = (agentHandle) => {
+    const queue = deferredSelections.get(agentHandle.session) ?? []
+    deferredSelections.set(agentHandle.session, [])
+    for (const event of queue) emit('session/event', agentHandle.session, event)
   }
   const userText = (id = `msg-${++agentCounter}`) => ({
     id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Question' }],
@@ -109,7 +128,8 @@ function harness(config = {}) {
     })
     return { model: agentHandle.model.current(), messages }
   }
-  return { agent, userText, userImage, insert, run, done, claim, emit, log, coordinator, durable }
+  return { agent, userText, userImage, insert, run, done, claim, emit, flushSelections, log, coordinator, durable,
+    configure(next) { if ('routing' in next) routing = next.routing } }
 }
 
 test('the durable lease is written before the host selection and carries the complete lease record', () => {
@@ -162,6 +182,7 @@ test('an effort-only change never closes DVR ownership of the lease', () => {
   const agent = t.agent()
   t.insert(agent, t.userImage())
   t.run(agent)
+  t.claim(agent)
   // An RC1 AgentModel.select with an identical provider/model is a no-op, so
   // an effort-only commit reaches DVR only as a re-committed durable selection
   // (for example a resumed Session re-consuming its pending modelSelection).
@@ -176,15 +197,20 @@ test('an effort-only change never closes DVR ownership of the lease', () => {
 })
 
 test('internal selection commits are ignored only on exact match, never swallowing foreign selections', () => {
+  // Async-Host modeling: the image-turn commit's model/selection event has
+  // not fired yet, so the exact-match correlation record is still live when a
+  // foreign user selection commits. Flushing in commit order proves the
+  // internal event is ignored ONLY because it matches the record, while the
+  // foreign selection cancels the lease instead of being swallowed.
   const foreign = { provider: 'third-party', model: 'foreign' }
-  const t = harness({
-    afterSelectEmit: (agent) => {
-      t.emit('session/event', agent.session, { type: 'model/selection', data: { ...foreign } })
-    },
-  })
+  const t = harness({ deferSelectEvents: true })
   const agent = t.agent()
   t.insert(agent, t.userImage())
   t.run(agent)
+  t.claim(agent)
+  assert.ok(t.coordinator.routeLeaseOf(agent), 'the lease survives while its internal commit is still pending')
+  agent.model.select(foreign)
+  t.flushSelections(agent)
   assert.deepEqual(agent.model.current(), foreign, 'the foreign selection wins over the internal commit')
   assert.equal(t.coordinator.routeLeaseOf(agent), undefined, 'the correlation lock cancels the lease for the foreign route')
   assert.equal(t.durable.has(agent.session.id), false)
@@ -198,6 +224,10 @@ test('/vision off revokes a pending lease and restores the original chat selecti
   assert.equal(t.coordinator.revokePendingRouteLease(agent), true)
   assert.deepEqual(agent.model.current(), ORIGIN_SELECTION)
   assert.equal(t.durable.has(agent.session.id), false)
+  // /vision off also closes the session's auto-routing at the composition
+  // boundary (plan §3.1: off governs the next prompt assembly), so the still
+  // queued image turn must not open a fresh lease for the chat model.
+  t.configure({ routing: false })
   t.insert(agent, t.userText())
   t.done(agent)
   assert.deepEqual(t.claim(agent).model, ORIGIN_SELECTION)
@@ -220,14 +250,14 @@ test('/vision off cannot revoke an executed lease: the text turn still returns t
 
 test('restarting the process after the leased request executed restores the saved chat selection', () => {
   const durable = new Map()
-  const before = harness({ durable })
-  const agent = before.agent({ sessionId: 'durable-session' })
+  const before = harness({ durable, sessionId: 'durable-session' })
+  const agent = before.agent()
   before.insert(agent, before.userImage())
   before.run(agent)
   before.claim(agent)
 
-  const after = harness({ durable, generation: 'gen-2' })
-  const resumed = after.agent({ provider: 'hostvision', model: 'vision-pro', sessionId: 'durable-session' })
+  const after = harness({ durable, sessionId: 'durable-session', generation: 'gen-2' })
+  const resumed = after.agent({ provider: 'hostvision', model: 'vision-pro' })
   after.insert(resumed, after.userText())
   after.run(resumed)
   assert.deepEqual(after.claim(resumed).model, ORIGIN_SELECTION)
@@ -237,13 +267,13 @@ test('restarting the process after the leased request executed restores the save
 
 test('restarting before the leased request executed also restores the saved chat selection', () => {
   const durable = new Map()
-  const before = harness({ durable })
-  const agent = before.agent({ sessionId: 'pending-session' })
+  const before = harness({ durable, sessionId: 'pending-session' })
+  const agent = before.agent()
   before.insert(agent, before.userImage())
   before.run(agent)
 
-  const after = harness({ durable })
-  const resumed = after.agent({ provider: 'hostvision', model: 'vision-pro', sessionId: 'pending-session' })
+  const after = harness({ durable, sessionId: 'pending-session' })
+  const resumed = after.agent({ provider: 'hostvision', model: 'vision-pro' })
   after.insert(resumed, after.userText())
   after.run(resumed)
   assert.deepEqual(after.claim(resumed).model, ORIGIN_SELECTION)
@@ -252,13 +282,13 @@ test('restarting before the leased request executed also restores the saved chat
 
 test('recovery never overrides a foreign selection that replaced the leased route', () => {
   const durable = new Map()
-  const before = harness({ durable })
-  const agent = before.agent({ sessionId: 'foreign-session' })
+  const before = harness({ durable, sessionId: 'foreign-session' })
+  const agent = before.agent()
   before.insert(agent, before.userImage())
   before.run(agent)
 
-  const after = harness({ durable })
-  const resumed = after.agent({ provider: 'third-party', model: 'user-chosen', sessionId: 'foreign-session' })
+  const after = harness({ durable, sessionId: 'foreign-session' })
+  const resumed = after.agent({ provider: 'third-party', model: 'user-chosen' })
   after.insert(resumed, after.userText())
   after.run(resumed)
   assert.deepEqual(after.claim(resumed).model, { provider: 'third-party', model: 'user-chosen' })
@@ -269,14 +299,14 @@ test('recovery never overrides a foreign selection that replaced the leased rout
 test('a cold pending lease is revoked from the durable store, an executed one is left for warm-up recovery', () => {
   const pendingDurable = new Map()
   const executedDurable = new Map()
-  const pendingHost = harness({ durable: pendingDurable })
-  const executedHost = harness({ durable: executedDurable })
+  const pendingHost = harness({ durable: pendingDurable, sessionId: 'cold-pending' })
+  const executedHost = harness({ durable: executedDurable, sessionId: 'cold-executed' })
 
-  const pendingAgent = pendingHost.agent({ sessionId: 'cold-pending' })
+  const pendingAgent = pendingHost.agent()
   pendingHost.insert(pendingAgent, pendingHost.userImage())
   pendingHost.run(pendingAgent)
 
-  const executedAgent = executedHost.agent({ sessionId: 'cold-executed' })
+  const executedAgent = executedHost.agent()
   executedHost.insert(executedAgent, executedHost.userImage())
   executedHost.run(executedAgent)
   executedHost.claim(executedAgent)

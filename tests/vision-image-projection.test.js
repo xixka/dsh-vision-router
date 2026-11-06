@@ -118,7 +118,7 @@ function boundaryProjectForTextModel(messages) {
   })
 }
 
-function mockAdapter(name) {
+function mockAdapter(name, declaredModalities) {
   const state = { name, requests: [], imageBytes: 0, imageBlocks: 0, rejection: undefined }
   return {
     state,
@@ -128,9 +128,12 @@ function mockAdapter(name) {
       state.imageBlocks += found.length
       state.imageBytes += imageBytesReceived(request.messages)
       state.requests.push(request)
-      if (found.length > 0) {
-        // Mirrors llm-deepseek prepareImages rejecting image content for a
-        // model whose modalities do not admit images.
+      // Mirrors llm-deepseek prepareImages: an adapter rejects retained image
+      // content when its own model's modalities do not admit images
+      // (`model?.inputModalities?.includes('image') !== true`), so an
+      // image-capable route accepts the occurrences natively while an
+      // undeclared route still fails closed.
+      if (found.length > 0 && declaredModalities?.includes('image') !== true) {
         const rejection = new Error(`${name}: DeepSeek Messages image input requires a vision model and attachment service`)
         rejection.code = 'UNSUPPORTED_CONTENT'
         state.rejection = rejection
@@ -153,9 +156,9 @@ function dispatchThroughBoundary(request, route) {
   return route.adapter.dispatch({ ...request, messages })
 }
 
-const TEXT_ROUTE = { declared: ['text'], adapter: mockAdapter('text-chat-adapter') }
-const VISION_ROUTE = { declared: ['text', 'image'], adapter: mockAdapter('vision-adapter') }
-const UNDECLARED_ROUTE = { declared: undefined, adapter: mockAdapter('text-adapter-undeclared') }
+const TEXT_ROUTE = { declared: ['text'], adapter: mockAdapter('text-chat-adapter', ['text']) }
+const VISION_ROUTE = { declared: ['text', 'image'], adapter: mockAdapter('vision-adapter', ['text', 'image']) }
+const UNDECLARED_ROUTE = { declared: undefined, adapter: mockAdapter('text-adapter-undeclared', undefined) }
 
 const routeAcceptsImages = (provider, model) => {
   if (provider === 'hostvision') return true
