@@ -72,7 +72,8 @@ export interface VisionSessionAgent {
   steer(message: Readonly<UserMessage>): void
 }
 
-function visionSessionAgentOf(agent: unknown): VisionSessionAgent {
+/** Structural validation and projection of the Agent seam the service needs. */
+export function visionSessionAgentOf(agent: unknown): VisionSessionAgent {
   if (agent === null || (typeof agent !== 'object' && typeof agent !== 'function')) {
     throw new VisionSessionServiceError(
       'VISION_AGENT_INVALID',

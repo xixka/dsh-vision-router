@@ -16,10 +16,10 @@ import {
   throwIfVisionCancelled,
   visionSessionAgentOf,
   VISION_DEFAULT_TASK_PROMPT,
-  type SessionVisionPolicyPersistence,
   type VisionSessionService,
   type VisionSessionStatus,
 } from './vision-session-service.js'
+import type { SessionVisionPolicyPersistence } from './session-vision-policy.js'
 
 export { VISION_DEFAULT_TASK_PROMPT }
 

@@ -80,7 +80,7 @@ export interface SessionVisionPolicyStore {
 }
 
 /** A policy whose update counter and origin are guaranteed present. */
-export interface SessionVisionPolicyRevisioned extends Readonly<SessionVisionPolicy> {
+export type SessionVisionPolicyRevisioned = Readonly<SessionVisionPolicy> & {
   readonly updateRevision: number
   readonly updateOrigin: string
 }
@@ -171,7 +171,7 @@ export function normalizeSessionVisionPolicyUpdateRequest(
   if (request === null || typeof request !== 'object') {
     throw new TypeError('session vision policy update requires a request object')
   }
-  const candidate = request as Record<PropertyKey, unknown>
+  const candidate = request as unknown as Record<PropertyKey, unknown>
   if (typeof candidate.enabled !== 'boolean') {
     throw new TypeError('session vision policy update requires a boolean enabled')
   }
@@ -211,11 +211,17 @@ export function nextSessionVisionPolicy(
   const normalized = normalizeSessionVisionPolicyUpdateRequest(request)
   const updateRevision = (current?.updateRevision ?? 0) + 1
   if (normalized.source === 'delegation') {
+    // Normalize guarantees a non-empty inheritedFrom for delegation updates;
+    // the guard also protects direct callers that bypassed normalization.
+    const inheritedFrom = nonEmptyString(normalized.inheritedFrom)
+    if (inheritedFrom === undefined) {
+      throw new TypeError('delegation session vision policy updates require inheritedFrom')
+    }
     return Object.freeze({
       revision: SESSION_VISION_POLICY_REVISION,
       enabled: normalized.enabled,
       source: 'delegation',
-      inheritedFrom: normalized.inheritedFrom,
+      inheritedFrom,
       updateRevision,
       updateOrigin: normalized.origin,
     })
