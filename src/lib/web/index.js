@@ -15,6 +15,9 @@ const DEFAULT_INSTALLERS = Object.freeze({
   remoteSettings: installVisionRemoteSettingsClient,
   settingsFactoryLifecycle: installSettingsFactoryLifecycle,
   modelPresentation: installVisionModelPickerPresentation,
+  // Onboarding teaches the /vision command (on/off/status/<question>) through
+  // the settings walkthrough copy; the retired composer button carries no
+  // guide, chip, or highlight of its own anymore (plan §5.2).
   onboarding: installVisionOnboarding,
   modelControls: installVisionModelPickerControls,
   routingSection: installVisionRoutingSection,

@@ -7,6 +7,7 @@ import {
   migrateLegacyVisionSettings,
 } from '../lib/settings-migration.js'
 import { normalizeRuntimeVisionConfig } from '../lib/runtime-config-normalizer.js'
+import { Config } from '../index.js'
 
 function descriptor({ user = {}, value = {}, revision = 9 } = {}) {
   return {
@@ -189,4 +190,61 @@ test('retired compatibility values cannot reach normalized runtime config', () =
   assert.equal(Object.hasOwn(normalized, 'localDescribeStyle'), false)
   assert.equal(Object.hasOwn(normalized, 'visionGuideStep'), false)
   assert.equal(normalized.tool, true)
+})
+
+// ── P5 (plan §4.5): the retired routing/wrapper fields are READ-ONLY profile
+// compatibility data — parsed and preserved so old profiles keep resolving,
+// never a runtime switch and never a reason for the migration to rewrite the
+// visible providers chain. ──────────────────────────────────────────────────
+
+test('P5: retired wrapper/chain/auto-wrap/stealth fields stay read-only profile compatibility data', () => {
+  const legacy = Config({
+    autoWrapProviders: true,
+    wrappedProviders: [{ provider: 'deepseek-official', models: ['deepseek-v4-pro'] }],
+    wrapperRoute: 'deepseek-vision',
+    chainRoute: 'vision-chain',
+    stealth: true,
+  })
+  assert.equal(legacy.autoWrapProviders, true)
+  assert.deepEqual(
+    legacy.wrappedProviders,
+    [{ provider: 'deepseek-official', models: ['deepseek-v4-pro'] }],
+  )
+  assert.equal(legacy.wrapperRoute, 'deepseek-vision')
+  assert.equal(legacy.chainRoute, 'vision-chain')
+  assert.equal(legacy.stealth, true)
+})
+
+test('P5: retired-field defaults keep their historical values so old profiles resolve identically', () => {
+  const defaults = Config({})
+  assert.equal(defaults.autoWrapProviders, true)
+  assert.deepEqual(defaults.wrappedProviders, [{ provider: 'deepseek-official', models: [] }])
+  assert.equal(defaults.wrapperRoute, 'deepseek-vision')
+  assert.equal(defaults.chainRoute, 'vision-chain')
+  assert.equal(defaults.stealth, false)
+})
+
+test('P5: legacy shorthand migration is unaffected by the retired routing fields', () => {
+  const ops = legacySettingsMigrationOps(descriptor({
+    user: {
+      provider: 'openrouter',
+      model: 'qwen-vl',
+      wrapperRoute: 'deepseek-vision',
+      chainRoute: 'vision-chain',
+      stealth: true,
+      autoWrapProviders: true,
+      wrappedProviders: [{ provider: 'openrouter', models: [] }],
+    },
+  }))
+  // The shorthand providers row migrates exactly as it would without the
+  // retired fields, and every later op stays an unset (whether the engine
+  // tolerates them as read-only data today or retires them explicitly later):
+  // the visible providers chain is never rewritten because of them.
+  assert.deepEqual(ops[0], {
+    op: 'set',
+    path: ['providers'],
+    value: [{ provider: 'openrouter', model: 'qwen-vl', fallbacks: [] }],
+  })
+  assert.equal(ops.slice(1).every((op) => op.op === 'unset'), true)
+  assert.equal(ops.some((op) => op.op !== 'unset' && op.path[0] === 'providers'), false)
 })

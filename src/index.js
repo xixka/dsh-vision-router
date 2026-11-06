@@ -113,7 +113,6 @@ import {
   callAnthropicCompatible,
 } from './lib/catalog-corrections.js'
 import { providerTransportFor } from './lib/live-model-discovery.js'
-import { getOfficialDeepSeekCatalog } from './lib/official-deepseek-catalog.js'
 import {
   classifyVisionFailure,
   createDeadline,
@@ -161,7 +160,6 @@ import { visionRouterMessageSource } from './lib/session-message-source-compat.j
 
 import { streamWithLegacyGlobalProxyScope } from './lib/legacy-global-proxy-boundary.js'
 
-import { createCoalescingRunner } from './lib/adapter-update-coalescer.js'
 import { createDesktopScreenshotTool } from './lib/desktop-screenshot-tool.js'
 import { installVisionDiagnosticsRoutes } from './lib/vision-diagnostics-routes.js'
 import { blocksHaveRetainedImage, isOffloadedImageBlock, offloadedImagePlaceholder } from './lib/image-offload-compat.js'
@@ -183,6 +181,10 @@ export {
 export const name = 'vision-router'
 export const inject = ['tools', 'llm']
 
+// Each core.apply() is one plugin generation (a hot reset re-applies the
+// plugin); the route lease records it for cross-generation recovery.
+let visionRouterApplyGeneration = 0
+
 /** Default proxy host list: common foreign AI API domains; inert unless `proxy` is set. */
 export const DEFAULT_PROXY_HOSTS = [
   'api.openrouter.ai',
@@ -200,9 +202,9 @@ export const Config = z.object({
   provider: z.string().default('vision-http'),
   model: z.string().default('ovh/Qwen3.5-397B-A17B'),
   fallbacks: z.array(z.string()).default([]),
-  // 默认预置内置免费端点为第一行（与运行时兜底一致）：新用户在卡片里
-  // 直接看到「vision-http / ovh/Qwen2.5-VL-72B-Instruct（内置免费模型）」
-  // 这一行，往下加行即降级链。
+  // 默认预置内置免费端点为第一行（与运行时兜底一致）。P5 起 vision-http
+  // 行是 direct-backend 条目：由 provider transport 直接执行（免费链/自定义
+  // HTTP/Ollama/LM Studio），绝不作为 Host provider 查询（plan §4.5）。
   providers: z
     .array(
       z.object({
@@ -216,10 +218,12 @@ export const Config = z.object({
   // 调用视觉工具看图（可连续多步操作）。开启后恢复旧的整轮自动路由行为。
   routing: z.boolean().default(false),
   reverseRouting: z.boolean().default(true),
+  // P5 迁移字段（plan §4.5）：只读解析旧 profile，无运行时副作用——
+  // wrapper/chain 路由不再注册，legacy 整轮路由只选真实 Host 视觉模型。
   wrapperRoute: z.string().default('deepseek-vision'),
   chainRoute: z.string().default('vision-chain'),
-  // 历史配置字段保留用于 profile 兼容。DVR 2.3 支持的 Host 始终拥有
-  // deepseek-official；这个值不再授权 Vision Router 重建或接管官方 provider。
+  // P5 迁移字段（plan §4.5）：只读解析旧 profile，无运行时副作用。Host
+  // 始终拥有 deepseek-official；这个值从不授权重建或接管官方 provider。
   stealth: z.boolean().default(false),
   textProvider: z
     .object({
@@ -309,20 +313,13 @@ export const Config = z.object({
   // 云端识别成本降到零。默认关闭 = 保持既有顺序（用户配置在前、内置免费
   // 补全在后），关闭时行为与 current main 逐字节一致。
   freeCloudFirst: z.boolean().default(false),
-  // Automatically mirror every currently registered provider as an
-  // image-capable twin. The source registry is live (ctx.llm.listProviders),
-  // so providers added later through Settings are picked up by the existing
-  // llm/adapters-updated sync. The original route is never changed: even a
-  // native multimodal model may expose an additional + auto-vision entry so
-  // users can deliberately route image work through vision-router's toolchain.
+  // P5 迁移字段（plan §4.5）：autoWrapProviders 只读解析旧 profile，不再
+  // 生成任何 twin 路由——零 Provider 构建不注册镜像适配器，真实 Host 的
+  // 视觉模型由 /vision 指令流与只读 catalog 直接表达。
   autoWrapProviders: z.boolean().default(true),
-  // Text-provider routes the user wants wrapped as image-capable twins
-  // (e.g. opencode-go): each entry registers a "<provider>-vision" route
-  // whose catalog mirrors the original models but declares image input.
-  // 开箱预置一条 deepseek-official（与视觉模型链预置 vision-http 内置免费
-  // 端点同理）：新用户在卡片里第一眼就能看到官方 DeepSeek 行可发图。该路由
-  // 由插件内置包装（deepseek-vision）服务，syncTwins 跳过 ownRoutes，这条
-  // 默认条目只是声明/说明，不会重复注册。
+  // P5 迁移字段（plan §4.5）：wrappedProviders 只读解析旧 profile，不再
+  // 物化 "<provider>-vision" 路由；历史路由名仍被 fail-closed 守卫识别，
+  // 绝不当作视觉后端或 Host provider 查询。
   wrappedProviders: z
     .array(
       z.object({
@@ -478,7 +475,6 @@ import {
   localDescribePrompt,
   imageMemorySet,
   buildInstantLocalMap,
-  createWrapperStreamBody,
   modelInfoAcceptsImages,
   looksLikeNonGenerativeVisionModel,
   looksLikeVisionModel,
@@ -583,6 +579,7 @@ export {
 } from './lib/core-primitives.js'
 
 export function apply(ctx, config = {}, runtime = {}) {
+  const pluginGeneration = ++visionRouterApplyGeneration
   // Route sharp version diagnostics (issue #75) through the harness logger
   // instead of console.warn, so the warning lands in the server log.
   registerSharpWarningHook((message) => {
@@ -669,7 +666,6 @@ export function apply(ctx, config = {}, runtime = {}) {
     const value = current().wrapperRoute
     return typeof value === 'string' && value !== '' ? value : undefined
   }
-  let wrapperRegistered = false
   const textProvider = () => {
     const text = current().textProvider
     return {
@@ -912,27 +908,19 @@ export function apply(ctx, config = {}, runtime = {}) {
     return entries
   }
 
-  // Legacy whole-turn routing normally follows the configured provider rows.
-  // Local HTTP backends are configured in their own settings group, so inject
-  // them after explicit native rows and before any valid vision-http row. A
-  // stale built-in OVH row is dropped when freeFallback=false.
+  // P5 (plan §4.5): legacy whole-turn routing only ever selects REAL Host
+  // vision models. `vision-http/...` rows are direct-backend entries served by
+  // the provider transport through the vision tools — never Host routes — and
+  // local backends join only the tool-side chain (isLocalBackendPair below
+  // keeps the tool path's anti-hang budget semantics).
   const isLocalBackendPair = (pair) =>
     pair &&
     pair.provider === HTTP_ROUTE &&
     typeof pair.model === 'string' &&
     (pair.model.startsWith('local-ollama/') || pair.model.startsWith('local-lmstudio/'))
   const routingPairs = () => {
-    const availableHttp = new Set(httpEntries().map((entry) => entry.id))
-    const explicit = pairs()
-    const native = explicit.filter((pair) => pair && pair.provider !== HTTP_ROUTE)
-    const local = localProvidersOf(current())
-      .map((provider) => ({ provider: HTTP_ROUTE, model: `${provider.name}/${provider.model}` }))
-      .filter((pair) => availableHttp.has(pair.model))
-    const http = explicit.filter(
-      (pair) => pair && pair.provider === HTTP_ROUTE && availableHttp.has(pair.model),
-    )
     const seen = new Set()
-    const base = [...native, ...local, ...http].filter((pair) => {
+    const base = pairs().filter((pair) => pair && pair.provider !== HTTP_ROUTE).filter((pair) => {
       const key = `${pair.provider}/${pair.model}`
       if (seen.has(key)) return false
       seen.add(key)
@@ -941,548 +929,172 @@ export function apply(ctx, config = {}, runtime = {}) {
     return applyVisionExecutionOrder(base, currentVisionExecutionOrder())
   }
 
-  const routingPairWeight = (pair, entriesById) => {
-    if (pair.provider !== HTTP_ROUTE) return DEFAULT_HTTP_PROVIDERS.length
-    const entry = entriesById.get(pair.model)
-    return entry === undefined
-      ? DEFAULT_HTTP_PROVIDERS.length
-      : httpProviderFallbackWeight(entry.provider)
-  }
-  {
-    const httpAdapter = {
-      providerInfo(provider) {
-        return { id: provider, name: 'Vision HTTP' }
-      },
-      providerRetryPolicy() {
-        return undefined
-      },
-      async listModels() {
-        return []
-      },
-      async resolveModel(_provider, model) {
-        const entry = httpEntries().find((candidate) => candidate.id === model)
-        if (entry === undefined) {
-          throw new Error(`vision-http: unknown model "${model}"`)
-        }
-        return {
-          provider: HTTP_ROUTE,
-          // The llm service validates exact model metadata: `id` must equal
-          // the requested model or the call is refused (INVALID_MODEL_INFO).
-          id: model,
-          name: entry.name,
-          inputModalities: ['text', 'image'],
-          context: { contextWindow: 32768 },
-        }
-      },
-      async *stream(options) {
-        const entry = httpEntries().find((candidate) => candidate.id === options.model)
-        if (entry === undefined) {
-          yield {
-            type: 'finish',
-            reason: {
-              kind: 'error',
-              failure: { message: `vision-http: unknown model "${options.model}"`, code: 'NO_ADAPTER' },
-            },
+  // ── direct HTTP/local backend execution (plan §4.2/§4.5) ────────────────
+  //
+  // P5: `vision-http` is no longer a Host provider. Legacy `vision-http/...`
+  // rows migrate to direct-backend entries: the built-in free chain,
+  // configured HTTP providers, Ollama and LM Studio all execute through the
+  // provider transport, never through the llm registry. The stream keeps the
+  // harness chunk protocol so visionAnswer assembles it like any other.
+  const directHttpBackendStream = async function* (options) {
+    const entry = httpEntries().find((candidate) => candidate.id === options.model)
+    if (entry === undefined) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: { message: `vision-http: unknown model "${options.model}"`, code: 'NO_ADAPTER' },
+        },
+      }
+      return
+    }
+    const attachments = ctx.get('attachments')
+    const openAIMessages = []
+    for (const message of options.messages ?? []) {
+      if (!message || !Array.isArray(message.content)) continue
+      const content = []
+      for (const block of message.content) {
+        if (block && block.type === 'image' && block.attachment) {
+          if (isOffloadedImageBlock(block)) {
+            content.push({ type: 'text', text: offloadedImagePlaceholder(block) })
+            continue
           }
-          return
-        }
-        const attachments = ctx.get('attachments')
-        const openAIMessages = []
-        for (const message of options.messages ?? []) {
-          if (!message || !Array.isArray(message.content)) continue
-          const content = []
-          for (const block of message.content) {
-            if (block && block.type === 'image' && block.attachment) {
-              if (isOffloadedImageBlock(block)) {
-                content.push({ type: 'text', text: offloadedImagePlaceholder(block) })
-                continue
-              }
-              if (attachments === undefined) continue
-              try {
-                const stored = await attachments.readImage(block.attachment)
-                // Last-mile guard: never send oversized images to the vision
-                // endpoint — encoder cost scales with pixels and dominates
-                // tool-call latency on retina screenshots.
-                let bytes = stored.data
-                if (downscaleEnabled() && bytes && bytes.length > 0) {
-                  bytes = await downscaleImage(bytes, downscaleMaxPixels())
-                }
-                content.push(...toOpenAIContent([block], () => bytes))
-              } catch (error) {
-                ctx.logger?.warn(
-                  'vision-http: failed to read image attachment: %s',
-                  error && error.message ? error.message : String(error),
+          if (attachments === undefined) continue
+          try {
+            const stored = await attachments.readImage(block.attachment)
+            // Last-mile guard: never send oversized images to the vision
+            // endpoint — encoder cost scales with pixels and dominates
+            // tool-call latency on retina screenshots.
+            let bytes = stored.data
+            if (downscaleEnabled() && bytes && bytes.length > 0) {
+              bytes = await downscaleImage(bytes, downscaleMaxPixels())
+            }
+            content.push(...toOpenAIContent([block], () => bytes))
+          } catch (error) {
+            ctx.logger?.warn(
+              'vision-http: failed to read image attachment: %s',
+              error && error.message ? error.message : String(error),
+            )
+          }
+        } else if (block && block.type === 'tool-result') {
+          // The OpenAI wire has no tool-call frames to hang a `role: tool`
+          // message on, so fold nested tool-result content into this user
+          // message: otherwise the vision model silently loses tool text
+          // AND nested tool-result images.
+          const parts = []
+          for (const nested of Array.isArray(block.content) ? block.content : []) {
+            if (nested && nested.type === 'text' && typeof nested.text === 'string') {
+              parts.push(nested.text)
+            } else if (nested && nested.type === 'image') {
+              if (isOffloadedImageBlock(nested)) {
+                parts.push(offloadedImagePlaceholder(nested))
+              } else {
+                const attachment = nested.attachment || {}
+                const id = attachment.attachmentId || attachment.id || 'unknown'
+                parts.push(
+                  `[attached image: ${id}] this tool result contained an image; ` +
+                    'inspect it with vision_describe (or re-read it with read_image)',
                 )
               }
-            } else if (block && block.type === 'tool-result') {
-              // The OpenAI wire has no tool-call frames to hang a `role: tool`
-              // message on, so fold nested tool-result content into this user
-              // message: otherwise the vision model silently loses tool text
-              // AND nested tool-result images.
-              const parts = []
-              for (const nested of Array.isArray(block.content) ? block.content : []) {
-                if (nested && nested.type === 'text' && typeof nested.text === 'string') {
-                  parts.push(nested.text)
-                } else if (nested && nested.type === 'image') {
-                  if (isOffloadedImageBlock(nested)) {
-                    parts.push(offloadedImagePlaceholder(nested))
-                  } else {
-                    const attachment = nested.attachment || {}
-                    const id = attachment.attachmentId || attachment.id || 'unknown'
-                    parts.push(
-                      `[attached image: ${id}] this tool result contained an image; ` +
-                        'inspect it with vision_describe (or re-read it with read_image)',
-                    )
-                  }
-                }
-              }
-              if (parts.length > 0) {
-                const call = typeof block.toolCallId === 'string' ? block.toolCallId : ''
-                content.push({ type: 'text', text: `[tool result${call ? ` ${call}` : ''}]\n${parts.join('\n')}` })
-              }
-            } else if (block && block.type === 'text' && typeof block.text === 'string') {
-              content.push({ type: 'text', text: block.text })
             }
           }
-          if (content.length > 0) openAIMessages.push({ role: message.role, content })
-        }
-        let text = ''
-        try {
-          // Local backends (format=anthropic etc.) go through their own
-          // dispatcher; regular HTTP providers keep the plain OpenAI call.
-          // Both consume the same pre-built OpenAI content blocks (image_url
-          // data URIs); callLocalBackend converts them for the Anthropic and
-          // LM Studio native wires.
-          text = await ((entry.provider.format === 'anthropic' || entry.provider.format === 'lmstudio')
-            ? callLocalWithProviderTransport(entry.provider, openAIMessages, {
-                maxTokens: entry.provider.maxTokens ?? 4096,
-                signal: options.signal,
-                sessionId: options.sessionId,
-                resolveCredential,
-              })
-            : callOpenAIWithProviderTransport(entry.provider, openAIMessages, {
-                maxTokens: entry.provider.maxTokens ?? 4096,
-                signal: options.signal,
-                sessionId: options.sessionId,
-                resolveCredential,
-              }))
-        } catch (error) {
-          // Classify the failure (AUTH / RATE_LIMIT / …) so downstream error
-          // consumers and the agent see the machine-routable code, not prose.
-          const classification = classifyVisionFailure(error)
-          const failureCode =
-            classification.kind === VISION_FAILURE_KINDS.AUTH
-              ? 'AUTH'
-              : classification.kind === VISION_FAILURE_KINDS.RATE_LIMIT
-                ? 'RATE_LIMIT'
-                : classification.kind === VISION_FAILURE_KINDS.TIMEOUT
-                  ? 'TIMEOUT'
-                  : 'HTTP_PROVIDER_FAILED'
-          yield {
-            type: 'finish',
-            reason: {
-              kind: 'error',
-              failure: {
-                message: error && error.message ? error.message : String(error),
-                code: failureCode,
-              },
-            },
+          if (parts.length > 0) {
+            const call = typeof block.toolCallId === 'string' ? block.toolCallId : ''
+            content.push({ type: 'text', text: `[tool result${call ? ` ${call}` : ''}]\n${parts.join('\n')}` })
           }
-          return
+        } else if (block && block.type === 'text' && typeof block.text === 'string') {
+          content.push({ type: 'text', text: block.text })
         }
-        if (text !== '') {
-          // Emit the full harness chunk protocol: block-start/text-delta/
-          // block-end carry a block index, and assemblers (the vision_describe
-          // tool's included) accumulate text per index — a bare text-delta
-          // without an index is silently dropped, surfacing as empty content.
-          yield { type: 'block-start', index: 0, blockType: 'text' }
-          yield { type: 'text-delta', index: 0, text }
-          yield { type: 'block-end', index: 0, block: { type: 'text', text } }
-        }
-        yield { type: 'finish', reason: { kind: 'stop' } }
-      },
-    }
-    ctx.llm.registerAdapter([HTTP_ROUTE], httpAdapter)
-
-  }
-
-  // ── wrapper route: admission + display shim ────────────────────────────────
-  //
-  // The harness prompt admission rejects image messages when the selected
-  // session model does not declare image input, and the DeepSeek adapter
-  // hardcodes text-only. This wrapper route (`deepseek-vision` by default)
-  // declares image input so the admission passes, shows up in the model
-  // picker as "DeepSeek + 自动识图", and delegates only to the official
-  // DeepSeek adapter. DVR 2.3 never substitutes a hidden native provider.
-  //
-  // The adapter is built unconditionally; whether (and under which name) it
-  // mounts is reconciled reactively against the resolved settings document by
-  // syncRoutingMounts() below, so the card's wrapperRoute/routing switches
-  // take effect without a restart.
-  let wrapperAdapter
-  {
-    const wrapName = (name) => name ?? 'DeepSeek'
-    // The row is explicitly branded as DeepSeek, so its metadata and network
-    // authority must come from DeepSeek as well. `textProvider` is legacy
-    // configuration and must never let an arbitrary relay masquerade behind
-    // the special wrapper.
-    const wrapperDelegateRoute = () => 'deepseek-official'
-    const delegateAdapter = () => {
-      try {
-        return ctx.llm.registration(wrapperDelegateRoute()).adapter
-      } catch {
-        return undefined
       }
+      if (content.length > 0) openAIMessages.push({ role: message.role, content })
     }
-    wrapperAdapter = {
-      providerInfo(provider) {
-        return { id: provider, name: 'DeepSeek + 自动识图' }
-      },
-      providerRetryPolicy() {
-        try {
-          return ctx.llm.registration(wrapperDelegateRoute()).retryPolicy
-        } catch {
-          return undefined
-        }
-      },
-      async listModels() {
-        const entries = []
-        const real = delegateAdapter()
-        if (real !== undefined && typeof real.listModels === 'function') {
-          try {
-            const listed = await getOfficialDeepSeekCatalog(real)
-            entries.push(
-              ...(Array.isArray(listed) ? listed : [])
-                .filter((model) => model && typeof model.id === 'string' && model.id !== '')
-                .map((model) => ({
-                  ...model,
-                  provider: wrapperRoute(),
-                  name: wrapName(model.name),
-                  inputModalities: ['text', 'image'],
-                })),
-            )
-          } catch {
-            /* keep the vision entries below */
-          }
-        }
-        // Legacy routing markers: with whole-turn routing on, the vision-chain
-        // pairs must exist as picker entries declaring image input (admission
-        // runs before any plugin can switch the route). In the default
-        // tools-first mode they are noise — vision happens through tool calls,
-        // so the wrapper group only lists the DeepSeek text mirrors.
-        if (routingEnabled()) {
-          for (const pair of routingPairs()) {
-            if (!adapterAvailable(ctx.llm, pair.provider)) continue
-            entries.push({
-              provider: wrapperRoute(),
-              id: `${pair.provider}/${pair.model}`,
-              name: `${pair.provider}/${pair.model}（视觉）`,
-              inputModalities: ['text', 'image'],
-            })
-          }
-        }
-        return entries
-      },
-      async resolveModel(provider, model) {
-        // Vision-pair entries resolve against the pair's own adapter metadata.
-        const pair = routingPairs().find(
-          (candidate) => `${candidate.provider}/${candidate.model}` === model,
-        )
-        if (pair !== undefined && adapterAvailable(ctx.llm, pair.provider)) {
-          try {
-            const base = await ctx.llm.resolveModelInfo(pair.provider, pair.model)
-            return {
-              ...base,
-              // The picker entry id is the composite "provider/model" string;
-              // the llm service refuses metadata whose `id` does not equal the
-              // requested model exactly (INVALID_MODEL_INFO).
-              id: model,
-              provider: wrapperRoute(),
-              name: `${pair.provider}/${pair.model}（视觉）`,
-              inputModalities: ['text', 'image'],
-            }
-          } catch {
-            /* fall through to the official DeepSeek path */
-          }
-        }
-        const real = delegateAdapter()
-        if (real === undefined || typeof real.resolveModel !== 'function') {
-          throw new Error('vision-router: the official DeepSeek adapter is not available')
-        }
-        // Accept only models the live official catalog actually publishes.
-        // Some adapters can resolve arbitrary ids; that is not permission to
-        // expose them under the DeepSeek product identity.
-        if (typeof real.listModels !== 'function') {
-          throw new Error('vision-router: the official DeepSeek catalog is not available')
-        }
-        const listed = await getOfficialDeepSeekCatalog(real)
-        const admitted = Array.isArray(listed) && listed.some(
-          (entry) => entry && entry.id === model,
-        )
-        if (!admitted) {
-          throw new Error(`vision-router: DeepSeek model "${model}" is not in the live official catalog`)
-        }
-        const base = await real.resolveModel(wrapperDelegateRoute(), model)
-        return {
-          ...base,
-          provider: wrapperRoute(),
-          name: wrapName(base.name),
-          inputModalities: ['text', 'image'],
-        }
-      },
-      ...createWrapperStreamBody(ctx, {
-        imageMemory,
-        delegateProvider: wrapperDelegateRoute,
-        instantLocal: instantLocalProvider,
-        instantLocalStyle,
-        instantLocalTimeoutMs: timeoutMs,
-        instantLocalMaxPixels,
-        providerTransport,
-      }),
+    let text = ''
+    try {
+      // Local backends (format=anthropic etc.) go through their own
+      // dispatcher; regular HTTP providers keep the plain OpenAI call.
+      // Both consume the same pre-built OpenAI content blocks (image_url
+      // data URIs); callLocalBackend converts them for the Anthropic and
+      // LM Studio native wires.
+      text = await ((entry.provider.format === 'anthropic' || entry.provider.format === 'lmstudio')
+        ? callLocalWithProviderTransport(entry.provider, openAIMessages, {
+            maxTokens: entry.provider.maxTokens ?? 4096,
+            signal: options.signal,
+            sessionId: options.sessionId,
+            resolveCredential,
+          })
+        : callOpenAIWithProviderTransport(entry.provider, openAIMessages, {
+            maxTokens: entry.provider.maxTokens ?? 4096,
+            signal: options.signal,
+            sessionId: options.sessionId,
+            resolveCredential,
+          }))
+    } catch (error) {
+      // Classify the failure (AUTH / RATE_LIMIT / …) so downstream error
+      // consumers and the agent see the machine-routable code, not prose.
+      const classification = classifyVisionFailure(error)
+      const failureCode =
+        classification.kind === VISION_FAILURE_KINDS.AUTH
+          ? 'AUTH'
+          : classification.kind === VISION_FAILURE_KINDS.RATE_LIMIT
+            ? 'RATE_LIMIT'
+            : classification.kind === VISION_FAILURE_KINDS.TIMEOUT
+              ? 'TIMEOUT'
+              : 'HTTP_PROVIDER_FAILED'
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: error && error.message ? error.message : String(error),
+            code: failureCode,
+          },
+        },
+      }
+      return
     }
+    if (text !== '') {
+      // Emit the full harness chunk protocol: block-start/text-delta/
+      // block-end carry a block index, and assemblers (the vision_describe
+      // tool's included) accumulate text per index — a bare text-delta
+      // without an index is silently dropped, surfacing as empty content.
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'text-delta', index: 0, text }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+    }
+    yield { type: 'finish', reason: { kind: 'stop' } }
   }
 
-  // ── opt-in image-capable twins for other text-provider routes ─────────────
+  // ── retired wrapper route (plan §4.2, P5) ─────────────────────────────────
   //
-  // A session model on a third-party text-only route (e.g. opencode-go) is
-  // rejected by the host admission once the session contains images, because
-  // that route's catalog declares input:[text] and the admission runs before
-  // any plugin can rewrite the turn. `wrappedProviders` declares a twin
-  // route "<provider>-vision" that is materialized while its source is live,
-  // mirrors the original models, and declares
-  // image input, so the user gets an image-capable entry for exactly the
-  // routes they use. Text turns delegate byte-for-byte to the original
-  // adapter; image blocks are handled by the shared wrapper body (cached
-  // descriptions or compact tool-hint markers — the UI log keeps images).
-  const wrappedProviders = () =>
-    (current().wrappedProviders ?? []).filter(
-      (entry) => entry && typeof entry.provider === 'string' && entry.provider !== '',
-    )
+  // The `deepseek-vision` admission/display shim is retired: Vision Router
+  // registers no wrapper (and no twin or chain) route anymore. Read-only
+  // access to the Host registry (ctx.llm.registration, resolveModelInfo and
+  // the model catalog) stays untouched; `wrapperRoute`/`chainRoute` remain
+  // in the schema only so persisted profiles keep parsing (plan §4.5).
+
+  // ── retired provider twins (plan §4.2, P5) ─────────────────────────────────
+  //
+  // The "<provider>-vision" twin registration is retired: `autoWrapProviders`
+  // and `wrappedProviders` stay in the schema only so persisted profiles keep
+  // parsing (plan §4.5) and no longer materialize any route. The set below
+  // remains the fail-closed list of route names that must never be treated as
+  // vision backends or auto-discovery sources.
   const ownRoutes = () =>
     new Set(
       [wrapperRoute(), chainRoute(), HTTP_ROUTE, 'deepseek-official'].filter(
         (route) => route !== undefined && route !== null && route !== '',
       ),
     )
-  // Auto-discovery is registry-driven rather than settings-file-driven. A
-  // configured wrapper is intent only: materialize its twin only while the
-  // source route is live, so provider metadata is never snapshotted from the
-  // fallback route id before a settings-backed adapter has registered.
-  const liveProviderDirectory = () => {
-    if (typeof ctx.llm.listProviders !== 'function') return new Map()
-    try {
-      return new Map(
-        ctx.llm
-          .listProviders()
-          .filter((entry) => entry && typeof entry.id === 'string' && entry.id !== '')
-          .map((entry) => [
-            entry.id,
-            {
-              id: entry.id,
-              name:
-                typeof entry.name === 'string' && entry.name !== ''
-                  ? entry.name
-                  : entry.id,
-            },
-          ]),
-      )
-    } catch {
-      return new Map()
-    }
-  }
-  // Twins still delegate lazily per call because a live source adapter may be
-  // replaced without changing its route. The registration itself, however,
-  // is reconciled against live topology so a dormant configured provider does
-  // not publish a ghost `*-vision` route.
-  const twinHandles = new Map() // provider -> { handle, state, key }
-  const twinModelsKey = (models) => models.slice().sort().join('\u0000')
-  const twinSpecKey = (models, sourceName) => JSON.stringify([twinModelsKey(models), sourceName])
-  const makeTwinAdapter = (provider, state) => {
-    const twinRoute = `${provider}-vision`
-    const originalAdapter = () => {
-      try {
-        return ctx.llm.registration(provider).adapter
-      } catch {
-        return undefined
-      }
-    }
-    const sourceAcceptsImages = async (model) => {
-      const original = originalAdapter()
-      if (original === undefined || typeof original.resolveModel !== 'function') return false
-      try {
-        const info = await original.resolveModel(provider, model)
-        return Array.isArray(info && info.inputModalities) && info.inputModalities.includes('image')
-      } catch {
-        return false
-      }
-    }
-    // issue #103: the twin mirrors the source metadata one-to-one, so any
-    // reasoning.defaultEffort the source advertises is inherited as-is. The
-    // reasoning LEVEL itself stays a per-session picker choice (bottom-right
-    // selector): the wrapper body below preserves it across the twin switch
-    // by remembering the last explicit effort and re-injecting it on the
-    // later steps that arrive without one.
-    return {
-      providerInfo() {
-        return { id: twinRoute, name: `${state.sourceName} + 自动识图` }
-      },
-      providerRetryPolicy() {
-        const original = originalAdapter()
-        try {
-          return original && typeof original.providerRetryPolicy === 'function'
-            ? original.providerRetryPolicy(provider)
-            : undefined
-        } catch {
-          return undefined
-        }
-      },
-      async listModels() {
-        const original = originalAdapter()
-        if (original === undefined || typeof original.listModels !== 'function') return []
-        try {
-          const listed = await original.listModels(provider)
-          return listed
-            .filter((model) => state.models.length === 0 || state.models.includes(model.id))
-            .map((model) => ({ ...model, provider: twinRoute, inputModalities: ['text', 'image'] }))
-        } catch {
-          return []
-        }
-      },
-      async resolveModel(_provider, model) {
-        const original = originalAdapter()
-        if (original === undefined || typeof original.resolveModel !== 'function') {
-          throw new Error(`vision-router: wrapped provider "${provider}" has no adapter registered yet`)
-        }
-        const base = await original.resolveModel(provider, model)
-        return { ...base, provider: twinRoute, inputModalities: ['text', 'image'] }
-      },
-      ...createWrapperStreamBody(ctx, {
-        imageMemory,
-        delegateProvider: provider,
-        // A native multimodal source already knows how to consume the image.
-        // Keep that direct path intact and expose vision-router as optional
-        // precision tools instead of forcing an image -> text detour.
-        preserveImageInput: (options) => sourceAcceptsImages(options.model),
-        instantLocal: instantLocalProvider,
-        instantLocalStyle,
-        instantLocalTimeoutMs: timeoutMs,
-        instantLocalMaxPixels,
-        providerTransport,
-      }),
-    }
-  }
-  const reconcileTwins = () => {
-    const liveProviders = liveProviderDirectory()
-    const wanted = new Map()
-    // Default path: every live non-router provider gets a twin. The source
-    // route remains untouched, including native multimodal models; this adds a
-    // separate + auto-vision choice that deliberately uses vision-router.
-    if (current().autoWrapProviders === true) {
-      for (const [provider, info] of liveProviders) {
-        if (ownRoutes().has(provider) || provider.endsWith('-vision')) continue
-        wanted.set(provider, { models: [], sourceName: info.name })
-      }
-    }
-    // Explicit settings win for a provider and can narrow the twin to selected
-    // model ids. A dormant entry remains configuration intent only; the twin
-    // appears when the source route becomes live and `llm/adapters-updated`
-    // drives this reconciliation again.
-    for (const entry of wrappedProviders()) {
-      const provider = entry.provider
-      if (ownRoutes().has(provider) || provider.endsWith('-vision')) continue
-      const source = liveProviders.get(provider)
-      if (source === undefined) continue
-      const models = Array.isArray(entry.models)
-        ? entry.models.filter((model) => typeof model === 'string' && model !== '')
-        : []
-      wanted.set(provider, { models, sourceName: source.name })
-    }
 
-    // Withdraw twins whose source/intent disappeared. For a still-live twin,
-    // update presentation metadata/model filters through the Host's atomic
-    // registration replace seam: DSH re-reads providerInfo/retryPolicy before
-    // publishing, so active sessions never observe a dispose/register gap.
-    for (const [provider, held] of [...twinHandles.entries()]) {
-      const spec = wanted.get(provider)
-      if (spec === undefined) {
-        try {
-          held.registration()
-          twinHandles.delete(provider)
-        } catch (error) {
-          ctx.logger?.warn(
-            'vision-router: twin route %s disposal failed: %s',
-            `${provider}-vision`,
-            error && error.message ? error.message : String(error),
-          )
-        }
-        continue
-      }
-      const nextKey = twinSpecKey(spec.models, spec.sourceName)
-      if (nextKey !== held.key) {
-        const previousModels = held.state.models
-        const previousSourceName = held.state.sourceName
-        held.state.models = spec.models
-        held.state.sourceName = spec.sourceName
-        try {
-          held.registration.replace([`${provider}-vision`])
-          held.key = nextKey
-        } catch (error) {
-          held.state.models = previousModels
-          held.state.sourceName = previousSourceName
-          ctx.logger?.warn(
-            'vision-router: twin route %s refresh failed: %s',
-            `${provider}-vision`,
-            error && error.message ? error.message : String(error),
-          )
-        }
-      }
-      wanted.delete(provider)
-    }
 
-    // Register only twins whose source is live. Registration publishes the
-    // correct display name on the first snapshot, fixing #446 without weakening
-    // the client's fail-closed ownership/name checks.
-    for (const [provider, spec] of wanted) {
-      const twinRoute = `${provider}-vision`
-      const state = { models: spec.models, sourceName: spec.sourceName }
-      try {
-        const registration = ctx.llm.registerAdapter(
-          [twinRoute],
-          makeTwinAdapter(provider, state),
-        )
-        twinHandles.set(provider, {
-          registration,
-          state,
-          key: twinSpecKey(spec.models, spec.sourceName),
-        })
-      } catch (error) {
-        ctx.logger?.warn(
-          'vision-router: twin route %s registration failed: %s',
-          twinRoute,
-          error && error.message ? error.message : String(error),
-        )
-      }
-    }
-  }
-  const syncTwins = createCoalescingRunner(reconcileTwins, {
-    onNonConverging({ passes }) {
-      ctx.logger?.error?.(
-        'vision-router: twin reconciliation did not converge after %d synchronous passes; stopping this cycle',
-        passes,
-      )
-    },
-  })
-  syncTwins()
-  ctx.on('llm/adapters-updated', syncTwins)
-
-  // A generated + 自动识图 route is an admission/tool wrapper, not a real
+  // A historical + 自动识图 route is an admission/tool wrapper, not a real
   // vision backend. Never offer it as an eye model or recurse into it from
-  // vision_describe. The built-in vision-http route is the deliberate
-  // exception: it is a real image-capable backend implemented by this plugin.
+  // vision_describe. P5 never registers those routes (plan §4.2), but legacy
+  // profiles can still name them, so the guard stays fail-closed by suffix and
+  // by the configured wrapper/chain route names.
   const isGeneratedVisionWrapperRoute = (provider) => {
     if (provider === wrapperRoute() || provider === chainRoute()) return true
-    if (typeof provider !== 'string' || !provider.endsWith('-vision')) return false
-    return twinHandles.has(provider.slice(0, -'-vision'.length))
+    return typeof provider === 'string' && provider.endsWith('-vision')
   }
 
   const resolveVisionBackendCapability = async (provider, model) => {
@@ -1782,6 +1394,24 @@ export function apply(ctx, config = {}, runtime = {}) {
   const callVisionPair = async (pair, messages, options = {}) => {
     const corrected = await correctedVisionAnswer(pair, messages, options)
     if (corrected !== undefined) return corrected
+    if (pair.provider === HTTP_ROUTE) {
+      // Direct-backend execution (plan §4.2/§4.5): the free chain, custom
+      // HTTP and Ollama/LM Studio entries never touch the Host llm registry.
+      return visionAnswer({
+        stream(streamOptions) {
+          return directHttpBackendStream(streamOptions)
+        },
+      }, {
+        provider: pair.provider,
+        model: pair.model,
+        messages,
+        maxTokens: options.maxTokens ?? 4096,
+        signal: options.signal,
+        ...(rawSessionIdentity(options.sessionId) === undefined
+          ? {}
+          : { sessionId: rawSessionIdentity(options.sessionId) }),
+      })
+    }
     assertOpenCodeGoAffinityForPair(pair, options.sessionId)
     return visionAnswer({
       stream(streamOptions) {
@@ -1932,424 +1562,13 @@ export function apply(ctx, config = {}, runtime = {}) {
     return applyVisionExecutionOrder(out, currentVisionExecutionOrder())
   }
 
-  // ── vision chain route: fallback under our own control ─────────────────────
+  // ── retired vision chain route (plan §4.2, P5) ─────────────────────────────
   //
-  // The agent-loop's request-error retry is owned by dsh-llm-retry, which sits
-  // OUTSIDE this plugin in the waterfall and can overrule a plugin's
-  // model-switch retry. To make fallback reliable, image turns are routed to
-  // this chain adapter instead; it walks the configured providers itself and
-  // only surfaces a failure once every model has failed.
-  //
-  // Built unconditionally; syncRoutingMounts() below mounts it whenever the
-  // resolved settings enable routing, so the card's routing switch takes
-  // effect without a restart.
-  let chainAdapter
-  {
-    chainAdapter = {
-      providerInfo(provider) {
-        return { id: provider, name: 'Vision Chain' }
-      },
-      providerRetryPolicy() {
-        return undefined
-      },
-      async listModels() {
-        const entries = []
-        for (const pair of routingPairs()) {
-          if (pair.provider !== HTTP_ROUTE && !adapterAvailable(ctx.llm, pair.provider)) continue
-          const capability = await resolveVisionBackendCapability(pair.provider, pair.model)
-          if (capability.attemptable === false) continue
-          entries.push({
-            provider: chainRoute(),
-            id: `${pair.provider}/${pair.model}`,
-            name: `${pair.provider}/${pair.model}`,
-            inputModalities: ['text', 'image'],
-          })
-        }
-        return entries
-      },
-      async resolveModel(provider, model) {
-        return {
-          provider: chainRoute(),
-          id: model,
-          name: model,
-          inputModalities: ['text', 'image'],
-          context: { contextWindow: 128000 },
-        }
-      },
-      async *stream(options) {
-        const failures = []
-        // Remember which images this turn is about, so a successful vision
-        // answer can be cached and later text turns can cite it.
-        const imageIds = []
-        const messages = options.messages ?? []
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const message = messages[i]
-          if (!message || message.role !== 'user' || !Array.isArray(message.content)) continue
-          // Deep collection: images nested inside tool-result blocks also
-          // identify this turn's subject and deserve memory recording.
-          for (const found of collectImageBlocks([message])) {
-            if (!isOffloadedImageBlock(found.block)) imageIds.push(found.id)
-          }
-          if (imageIds.length > 0) break
-        }
-        const chainPairs = routingPairs()
-        const chainHttpEntries = new Map(httpEntries().map((entry) => [entry.id, entry]))
-        // Fit the conversation into the target model's context window: a long
-        // session easily exceeds the 200-260k windows of typical vision models.
-        let defaultBudget = 256000
-        const firstPair = chainPairs[0]
-        if (firstPair !== undefined) {
-          try {
-            const base = await ctx.llm.resolveModelInfo(firstPair.provider, firstPair.model)
-            if (base.context && base.context.contextWindow > 0) {
-              defaultBudget = base.context.contextWindow
-            }
-          } catch {
-            /* keep default */
-          }
-        }
-        // One deadline for the whole fallback walk: chained backends share the
-        // remaining budget instead of each restarting its own timeout. Each
-        // candidate gets at most a fair share so a hung first backend cannot
-        // consume the entire deadline and starve every fallback.
-        const deadline = createDeadline(visionTaskTimeoutMs())
-        let remainingWeight = chainPairs.reduce(
-          (sum, pair) => sum + routingPairWeight(pair, chainHttpEntries),
-          0,
-        )
-        // Streaming a failed candidate is irreversible for the Host. When a
-        // fallback exists, stage its events until a successful finish so a
-        // second backend never appends to a broken first answer. Single-route
-        // and legacy text-only streams keep their existing streaming UX.
-        const holdCandidateEvents = imageIds.length > 0 && chainPairs.length > 1
-        const maxHeldEventBytes = 8 * 1024 * 1024
-        const maxHeldEvents = 32768
-        for (const pair of chainPairs) {
-          // Keep result text isolated by candidate; a failed stream's partial
-          // output must never count as recognition by the next backend.
-          let finalText = ''
-          const heldEvents = []
-          let heldBytes = 0
-          const candidateWeight = routingPairWeight(pair, chainHttpEntries)
-          const weightAtStart = Math.max(candidateWeight, remainingWeight)
-          remainingWeight = Math.max(0, remainingWeight - candidateWeight)
-          if (deadline.expired()) {
-            failures.push('deadline: the vision task budget was exhausted before this backend ran')
-            break
-          }
-          // Skip providers without a registered adapter up front: the failure
-          // is deterministic, and skipping keeps the exhaust message readable
-          // instead of interleaving stream errors with adapter noise.
-          if (!adapterAvailable(ctx.llm, pair.provider)) {
-            failures.push(
-              `${pair.provider}/${pair.model}: no adapter registered for provider "${pair.provider}"`,
-            )
-            ctx.logger?.warn(
-              'vision-router: chain skips %s/%s (no adapter)',
-              pair.provider,
-              pair.model,
-            )
-            continue
-          }
-          const backendKey = `${pair.provider}/${pair.model}`
-          const fingerprint = await credentialFingerprintFor({ provider: pair.provider })
-          const gate = visionBreaker.inspect(backendKey, fingerprint, 'chain')
-          if (gate.blocked) {
-            failures.push(`${backendKey}: skipped (circuit open: ${gate.reason})`)
-            continue
-          }
-          const capability = await resolveVisionBackendCapability(pair.provider, pair.model)
-          if (capability.attemptable === false) {
-            failures.push(
-              `${pair.provider}/${pair.model}: structurally unavailable (${capability.reason ?? 'unknown reason'})`,
-            )
-            ctx.logger?.warn(
-              'vision-router: chain skips %s/%s (structurally unavailable: %s)',
-              pair.provider,
-              pair.model,
-              capability.reason ?? 'unknown reason',
-            )
-            continue
-          }
-          if (!capability.image) {
-            ctx.logger?.info(
-              'vision-router: chain tries %s/%s despite advisory image capability (%s)',
-              pair.provider,
-              pair.model,
-              capability.reason ?? 'not declared',
-            )
-          }
-          let budget = defaultBudget
-          try {
-            const info = await ctx.llm.resolveModelInfo(pair.provider, pair.model)
-            if (info.context && info.context.contextWindow > 0) {
-              budget = info.context.contextWindow
-            }
-          } catch {
-            /* keep default */
-          }
-          const reserve = 32768
-          const messages =
-            estimateMessages(options.messages) > budget - reserve
-              ? trimMessagesToBudget(options.messages, Math.max(budget - reserve, 16384))
-              : options.messages
-          let succeeded = false
-          let failed = false
-          let failMessage = 'unknown error'
-          let failCode
-          try {
-            // Local backends get an independent anti-hang budget: a hung local
-            // service must not consume the whole deadline and starve the
-            // existing chain. Regular providers keep main's per-call timeout.
-            const attemptBudgetMs = isLocalBackendPair(pair)
-              ? weightedFallbackBudget(
-                  deadline.remaining(),
-                  timeoutMs(),
-                  candidateWeight,
-                  weightAtStart,
-                )
-              : timeoutMs()
-            const attemptSignal = combineSignals(
-              options.signal,
-              deadline.signal(),
-              AbortSignal.timeout(attemptBudgetMs),
-            )
-            const streamPair = async function* () {
-              // Catalog routing corrections: pairs whose installed catalog
-              // points at the wrong wire protocol are answered directly over
-              // the corrected endpoint instead of the harness adapter.
-              const text = await correctedVisionAnswer(pair, messages, {
-                maxTokens: options.maxTokens ?? 65536,
-                signal: attemptSignal,
-                sessionId: options.sessionId,
-              })
-              if (text === undefined) {
-                assertOpenCodeGoAffinityForPair(pair, options.sessionId)
-                yield* streamWithLegacyGlobalProxyScope(
-                  pair.provider,
-                  pair.model,
-                  () => streamWithVisionSessionAffinity(options.sessionId, () => ctx.llm.stream({
-                    ...options,
-                    provider: pair.provider,
-                    model: pair.model,
-                    reasoningEffort: undefined,
-                    messages,
-                    signal: attemptSignal,
-                  })),
-                )
-                return
-              }
-              if (text !== '') {
-                // Same chunk protocol as the vision-http route: a bare
-                // text-delta without block frames is dropped by assemblers.
-                yield { type: 'block-start', index: 0, blockType: 'text' }
-                yield { type: 'text-delta', index: 0, text }
-                yield { type: 'block-end', index: 0, block: { type: 'text', text } }
-              }
-              yield { type: 'finish', reason: { kind: 'stop' } }
-            }
-            for await (const chunk of streamVisionWithAbort(streamPair(), attemptSignal)) {
-              if (chunk && chunk.type === 'finish') {
-                const kind = chunk.reason && chunk.reason.kind
-                if (kind === 'error' || kind === 'aborted') {
-                  failMessage =
-                    (chunk.reason && chunk.reason.failure && chunk.reason.failure.message) || kind
-                  failed = true
-                  break
-                }
-                // Tool-call handoffs may legitimately have no text, but a
-                // completed recognition with no text is not a usable answer.
-                // It must not suppress fallback or cache an earlier failed
-                // candidate's partial output as this backend's result.
-                if (imageIds.length > 0 && (kind === 'stop' || kind === 'max-tokens') && finalText.trim() === '') {
-                  failed = true
-                  failCode = 'EMPTY_RESPONSE'
-                  failMessage = 'vision chain backend returned empty content'
-                  break
-                }
-                succeeded = true
-                // 视觉链成功留痕：谁识别了几张图、写入跨轮缓存——排障时
-                // "这张图的描述是谁生成的"一眼可查（原版此处静默）。
-                ctx.logger?.info(
-                  'vision-router: vision chain recognized %d image(s) via %s (memory written)',
-                  imageIds.length,
-                  backendKey,
-                )
-                if (finalText.trim() && imageIds.length > 0) {
-                  const record = finalText.trim()
-                  for (const id of imageIds) imageMemorySet(imageMemory, id, record)
-                }
-                if (holdCandidateEvents) {
-                  for (const event of heldEvents) yield event
-                }
-                yield chunk
-                break
-              }
-              if (chunk && typeof chunk.text === 'string') finalText += chunk.text
-              if (holdCandidateEvents) {
-                const bytes = Buffer.byteLength(JSON.stringify(chunk) ?? '', 'utf8')
-                if (heldEvents.length >= maxHeldEvents || heldBytes + bytes > maxHeldEventBytes) {
-                  failCode = 'VISION_CHAIN_BUFFER_LIMIT'
-                  throw new Error('vision chain candidate output exceeded safe fallback buffer limit')
-                }
-                heldEvents.push(chunk)
-                heldBytes += bytes
-              } else {
-                yield chunk
-              }
-            }
-            if (!succeeded && !failed && imageIds.length > 0) {
-              // An adapter can end iteration without emitting the mandatory
-              // terminal finish. Do not silently close the Agent stream and
-              // strand a later model that could recover the visual answer.
-              failed = true
-              failCode = 'EMPTY_RESPONSE'
-              failMessage = 'vision chain backend ended without a finish event'
-            }
-          } catch (error) {
-            failed = true
-            failMessage = error && error.message ? error.message : String(error)
-          }
-          if (failed) {
-            const classification = classifyVisionFailure(
-              failCode ? { code: failCode, message: failMessage } : failMessage,
-            )
-            visionBreaker.record(backendKey, fingerprint, classification, 'chain')
-            failures.push(`${pair.provider}/${pair.model}: ${failMessage}`)
-            ctx.logger?.warn('vision-router: chain fallback (%s) -> %s', classification.kind, failMessage)
-            continue
-          }
-          return
-        }
-        yield {
-          type: 'finish',
-          reason: {
-            kind: 'error',
-            failure: {
-              message: `all vision models failed: ${failures.join(' | ')}`,
-              code: 'VISION_CHAIN_EXHAUSTED',
-            },
-          },
-        }
-      },
-    }
+  // The whole-turn `vision-chain` adapter is retired: legacy whole-turn
+  // routing only ever selects REAL Host vision models (plan §4.5), and the
+  // vision tools walk the configured backends themselves through the provider
+  // transport (the tool chain already had its own direct fallback walk).
 
-    // The chain's own deadline starts after initial model-info preflight.
-    // A noncooperative discovery/capability adapter can therefore keep the
-    // entire Agent turn pending before the first streamed chunk. Protect the
-    // COMPLETE image-bearing stream, not only individual model iterator.next()
-    // calls. Text-only legacy routes retain their existing semantics.
-    const innerChainStream = chainAdapter.stream
-    chainAdapter.stream = async function* boundedVisionChainStream(options) {
-      const imageBearing = collectImageBlocks(options?.messages ?? [])
-        .some(({ block }) => !isOffloadedImageBlock(block))
-      if (!imageBearing) {
-        yield* innerChainStream.call(this, options)
-        return
-      }
-      const budgetSignal = AbortSignal.timeout(visionTaskTimeoutMs())
-      const signal = combineSignals(options?.signal, budgetSignal)
-      try {
-        for await (const chunk of streamVisionWithAbort(
-          innerChainStream.call(this, { ...options, signal }),
-          signal,
-        )) {
-          yield chunk
-          // The Host only accepts one terminal event. Do not remain blocked in
-          // a broken iterator's post-finish cleanup, or emit an error later.
-          if (chunk?.type === 'finish') return
-        }
-      } catch (error) {
-        if (!signal.aborted) throw error
-        if (options?.signal?.aborted) {
-          yield { type: 'finish', reason: { kind: 'aborted' } }
-          return
-        }
-        yield {
-          type: 'finish',
-          reason: {
-            kind: 'error',
-            failure: {
-              code: 'VISION_CHAIN_EXHAUSTED',
-              message: 'vision task timed out before the model finished preparing or responding',
-            },
-          },
-        }
-      }
-    }
-  }
-
-  // ── reactive routing mounts ────────────────────────────────────────────────
-  //
-  // Legacy routing used to be composition-gated at apply time while the
-  // settings card exposes the same switches — flipping them mid-session left
-  // the flow half-wired (hooks reading the settings document against mounts
-  // registered from the composition). The wrapper route, the chain route and
-  // the agent/request hook now reconcile against the resolved settings
-  // document: the settings seam below runs one initial sync and re-syncs on
-  // every document change, so toggles take effect immediately.
-  let wrapperRouteHandle
-  let wrapperRouteMounted
-  let chainRouteHandle
-  let chainRouteMounted
-  const syncRoutingMounts = () => {
-    const wantWrapper = wrapperRoute()
-    if (wantWrapper !== wrapperRouteMounted) {
-      if (wrapperRouteHandle) {
-        wrapperRouteHandle()
-        wrapperRouteHandle = undefined
-        wrapperRouteMounted = undefined
-      }
-      wrapperRegistered = false
-      if (wantWrapper !== undefined) {
-        try {
-          wrapperRouteHandle = ctx.llm.registerAdapter([wantWrapper], wrapperAdapter)
-          wrapperRouteMounted = wantWrapper
-          wrapperRegistered = true
-        } catch (error) {
-          if (error && error.code === 'DUPLICATE_ADAPTER') {
-            // Another layer already serves this name: adopt it and keep the
-            // flow functional instead of failing the apply.
-            wrapperRouteMounted = wantWrapper
-            wrapperRegistered = true
-          } else {
-            throw error
-          }
-        }
-      }
-    }
-    const wantChain = routingEnabled() ? chainRoute() : undefined
-    if (wantChain !== chainRouteMounted) {
-      if (chainRouteHandle) {
-        chainRouteHandle()
-        chainRouteHandle = undefined
-        chainRouteMounted = undefined
-      }
-      if (wantChain !== undefined) {
-        try {
-          chainRouteHandle = ctx.llm.registerAdapter([wantChain], chainAdapter)
-          chainRouteMounted = wantChain
-        } catch (error) {
-          if (error && error.code === 'DUPLICATE_ADAPTER') {
-            chainRouteMounted = wantChain
-          } else {
-            throw error
-          }
-        }
-      }
-    }
-  }
-  ctx.effect(
-    () => () => {
-      if (wrapperRouteHandle) wrapperRouteHandle()
-      if (chainRouteHandle) chainRouteHandle()
-      wrapperRouteHandle = undefined
-      chainRouteHandle = undefined
-      wrapperRouteMounted = undefined
-      chainRouteMounted = undefined
-    },
-    'vision-router: reactive routing mounts',
-  )
   // #208: attachment refs and description memory are owned by the same
   // bounded SessionVisionStateStore above. Historical ref recovery stays
   // target-only inside SessionVisionIndex rather than maintaining a log cursor.
@@ -2445,6 +1664,64 @@ export function apply(ctx, config = {}, runtime = {}) {
     }
   })
 
+  // ── P5 provider-free pre-step wiring (plan §4.3/§4.4) ─────────────────────
+  //
+  // The pre-step router and the image projection both need SYNCHRONOUS
+  // attestation of the Host's declared model modalities. Declared metadata is
+  // async (ctx.llm.resolveModelInfo), so keep a per-pair cache of the DECLARED
+  // inputModalities (never DVR's own capability inference) refreshed at mount
+  // and on adapter-topology changes. Unknown entries are never attested in
+  // either direction: routing fails closed to the chat model and projection
+  // stays off (no misreported modalities, no degraded native vision).
+  const declaredRouteModalities = new Map() // "provider/model" -> { known, image }
+  const refreshDeclaredRouteModalities = async () => {
+    const attest = async (provider, model) => {
+      if (!provider || !model) return
+      if (!adapterAvailable(ctx.llm, provider)) return
+      try {
+        const info = await ctx.llm.resolveModelInfo(provider, model)
+        const modalities = Array.isArray(info && info.inputModalities) ? info.inputModalities : undefined
+        declaredRouteModalities.set(`${provider}/${model}`, {
+          known: modalities !== undefined,
+          image: modalities !== undefined && modalities.includes('image'),
+        })
+      } catch {
+        // Unresolvable metadata stays unattested; every consumer fails closed.
+      }
+    }
+    for (const pair of routingPairs()) {
+      if (!pair || pair.provider === HTTP_ROUTE) continue
+      await attest(pair.provider, pair.model)
+    }
+    // The designated text chat provider joins the attestation set too: it is
+    // the route whole-turn routing restores to and the one the projection most
+    // often needs to attest as text-only.
+    const text = textProvider()
+    await attest(text.provider, text.model)
+  }
+  ctx.on('llm/adapters-updated', () => {
+    void refreshDeclaredRouteModalities()
+  })
+  void refreshDeclaredRouteModalities()
+  // Attestation mirrors the Host's DECLARED metadata only (absent = unknown).
+  const routeSupportsImages = (provider, model) => {
+    const record = declaredRouteModalities.get(`${provider}/${model}`)
+    return record !== undefined && record.known === true ? record.image : undefined
+  }
+  // The only selectable whole-turn image route is a REAL Host provider/model
+  // with a DECLARED image modality (plan §4.3); direct HTTP/local/free backends
+  // serve the vision tools instead and are never Host routes.
+  const hostVisionRoute = () => {
+    for (const pair of routingPairs()) {
+      if (!pair || pair.provider === HTTP_ROUTE) continue
+      if (!adapterAvailable(ctx.llm, pair.provider)) continue
+      if (routeSupportsImages(pair.provider, pair.model) === true) {
+        return { provider: pair.provider, model: pair.model }
+      }
+    }
+    return undefined
+  }
+
   // DSH >= 0.2.2 fixes the step model before pre-step and tools.resolve.
   // The Agent inbox/status event boundary runs after Session append finishes,
   // while selection can still be changed for the next step without reentrancy.
@@ -2455,7 +1732,8 @@ export function apply(ctx, config = {}, runtime = {}) {
     routingPairs,
     chainRoute,
     wrapperRoute,
-    wrapperRegistered: () => wrapperRegistered,
+    // P5: no wrapper route is ever registered (plan §4.2).
+    wrapperRegistered: () => false,
     textProvider,
     hasAdapter: (provider) => adapterAvailable(ctx.llm, provider),
     hasImage: blocksHaveRetainedImage,
@@ -2463,7 +1741,23 @@ export function apply(ctx, config = {}, runtime = {}) {
     autoActivateOnImageEnabled,
     structuredBootstrapEnabled,
     activateDeepTools: () => activateDeepTools(),
+    // P5 wiring (plan §4.3/§4.4, t5 handoff): attested real-Host vision
+    // routing, per-generation lease metadata, and the pre-step image
+    // projection listener. sessionRevision and the durable leaseStore are
+    // composition-owned seams (runtime-composition provides them through the
+    // runtime object); when the runtime omits leaseStore, the lease degrades
+    // to the in-process record.
+    hostVisionRoute,
+    routeSupportsImages,
+    pluginGeneration: () => pluginGeneration,
+    leaseStore: runtime?.leaseStore,
+    sessionRevision: runtime?.sessionRevision,
+    visionImageProjection: {
+      routeAcceptsImages: routeSupportsImages,
+      toolName: 'vision_describe',
+    },
   })
+  runtime?.visionSessionService?.registerRouteLeaseRevoker?.(preStepRouting)
 
   ctx.on('agent/pre-step', async (payload, next) => {
     let decision = await next()
@@ -2674,13 +1968,12 @@ export function apply(ctx, config = {}, runtime = {}) {
             ],
             source: visionRouterMessageSource(session),
           }
-          // 当前轮图片块的改写策略：有隐身/包装适配器时（默认安装）图片块
-          // 原样留在会话日志里（界面正常显示图片），由适配器在模型输入层
-          // 做不可见的改写；否则在 pre-step 改写为附件标记（界面会显示标记，
-          // 这是没有适配器时的兜底）。legacy routing 开启时保留原块走视觉链。
-          const adapterHandlesImages = wrapperRegistered
+          // 当前轮图片块的改写策略：P5 零 Provider 构建不再注册任何包装
+          // 适配器，文本模型路径在 pre-step 把图片块改写为附件标记（界面
+          // 会显示标记，这是文本模型的兜底）。legacy routing 开启时保留
+          // 原块走真实视觉模型。
           const base =
-            rewriteEnabled() && !routingEnabled() && !adapterHandlesImages
+            rewriteEnabled() && !routingEnabled()
               ? rewriteHistoryImages(messages, sessionImageMemory).messages
               : messages
           return {
@@ -2692,7 +1985,7 @@ export function apply(ctx, config = {}, runtime = {}) {
       // With routing disabled and no image-capable adapter on the session
       // route, rewrite uploaded image blocks into attachment markers so the
       // text-only model can still query them via vision_describe.
-      if (rewriteEnabled() && !routingEnabled() && !wrapperRegistered) {
+      if (rewriteEnabled() && !routingEnabled()) {
         const rewrittenHistory = rewriteHistoryImages(messages, sessionImageMemory).messages
         return {
           ...decision,
@@ -2725,8 +2018,8 @@ export function apply(ctx, config = {}, runtime = {}) {
   })
 
   // Registered unconditionally and gated at runtime so the settings card's
-  // routing switch takes effect immediately (syncRoutingMounts reconciles the
-  // adapters the same way).
+  // routing switch takes effect immediately: every read is live against
+  // current(), no adapter mount has to be reconciled (P5, plan §4.2).
   ctx.on('agent/request', async (payload, next) => {
     const config0 = await next()
     // The modern Host rejects any route change here. Its Agent.model already
@@ -2746,7 +2039,7 @@ export function apply(ctx, config = {}, runtime = {}) {
         const target = reverseRouteTarget(config0, {
           pairs: routingPairs(),
           wrapperRoute: wrapperRoute(),
-          wrapperRegistered,
+          wrapperRegistered: false,
           textProvider: textProvider(),
           hasAdapter: (provider) => adapterAvailable(ctx.llm, provider),
         })
@@ -2756,16 +2049,11 @@ export function apply(ctx, config = {}, runtime = {}) {
       }
       return config0
     }
-    // Route the image turn to the chain adapter (falls back under our own
-    // control), or directly to the first vision model when the chain route
-    // is disabled.
+    // Route the image turn directly to the first REAL Host vision model.
+    // The legacy vision-chain adapter no longer exists (plan §4.2/§4.5); with
+    // no native vision row configured the chat model stays unchanged and the
+    // vision tools serve the image instead.
     const routePairs = routingPairs()
-    if (chainRoute() !== undefined) {
-      if (config0.provider === chainRoute()) return config0
-      const first = routePairs[0]
-      if (first === undefined) return config0
-      return switchRoute(config0, chainRoute(), `${first.provider}/${first.model}`)
-    }
     const first = routePairs[0]
     if (first === undefined || config0.provider === first.provider) return config0
     return switchRoute(config0, first.provider, first.model)
@@ -5013,22 +4301,10 @@ ctx.logger?.info(
       base: config,
     })
     current = () => scope.get()
-    // With the settings document now visible, reconcile the routing mounts
-    // (wrapper route, chain route) against the resolved values.
-    syncRoutingMounts()
-    let disposeWatch
-    if (typeof scope.watch === 'function') {
-      disposeWatch = scope.watch(() => {
-        // Most consumers read current() per call, but the wrappedProviders
-        // twins and the routing mounts are registered eagerly: re-sync them
-        // whenever the settings document loads or the user edits the card.
-        syncTwins()
-        syncRoutingMounts()
-      })
-    }
+    // P5 (plan §4.2/§4.5): the provider-free build registers no routes, so no
+    // eager reconciliation remains — every consumer reads current() per call
+    // and a settings save takes effect immediately.
     const restore = () => {
-      if (typeof disposeWatch === 'function') disposeWatch()
-      disposeWatch = undefined
       // The settings provider went away: fall back to the composition entry.
       current = () => config
     }
@@ -5073,23 +4349,9 @@ ctx.logger?.info(
     },
   })
 
-  // Expose the namespace to the web configuration boundary. The API proxy
-  // serves settings describe/mutate ONLY for configurable-provider namespaces
-  // (plus a fixed product allowlist) — without this directory entry the Web
-  // card's settingsScope binder reports the namespace as unavailable.
-  try {
-    ctx.llm.registerConfigurableProviders([
-      {
-        provider: 'vision-router',
-        displayName: '视觉路由（自动识图）',
-        settingsNs: 'vision-router',
-        settingsPath: [],
-      },
-    ])
-  } catch (error) {
-    ctx.logger?.warn(
-      'vision-router: configurable provider registration failed: %s',
-      error && error.message ? error.message : String(error),
-    )
-  }
+  // P5 (plan §4.2): the LLM configurable-provider directory serves LLM route
+  // providers only. The settings card is owned by the public Settings
+  // registration above — DSH's SettingsForms/configForms mirror every active
+  // plugin namespace — so Vision Router no longer declares a directory entry
+  // and writes no model-directory state at all.
 }

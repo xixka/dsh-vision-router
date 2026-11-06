@@ -8,7 +8,6 @@ import { CLIENT_PRESENTATION_PRELUDE } from '../lib/client-presentation-boundary
 import { LIVE_MODEL_CLIENT_PRELUDE } from '../lib/live-model-client-prelude.js'
 import { SETTINGS_FACTORY_LIFECYCLE_PRELUDE } from '../lib/settings-factory-lifecycle.js'
 import { SETTINGS_NUMBER_META } from '../lib/settings-number-contract.js'
-import { VISION_MODEL_VISIBILITY_PRELUDE } from '../lib/vision-model-visibility-boundary-main.js'
 import { V2_SETTINGS_IA_CLIENT } from '../lib/v2-settings-ia-integration.js'
 import { VISION_TURN_BUDGET_CLIENT_PRELUDE } from '../lib/vision-turn-budget-client-prelude.js'
 
@@ -158,7 +157,6 @@ function alphaHarness() {
     CLIENT_HOST_COMPAT_PRELUDE,
     CLIENT_PRESENTATION_PRELUDE,
     LIVE_MODEL_CLIENT_PRELUDE,
-    VISION_MODEL_VISIBILITY_PRELUDE,
     SETTINGS_FACTORY_LIFECYCLE_PRELUDE,
     VISION_TURN_BUDGET_CLIENT_PRELUDE,
   ]) {
@@ -334,12 +332,13 @@ test('alpha.1 real DVR browser lifecycle keeps one Settings IA surface and all c
   assert.ok(ledger.some((entry) => entry.options?.name === 'tool.call.toolview' && entry.options?.key === 'vision_present'))
 })
 
-test('alpha.1 live transition keeps stock model selector visibility projection', () => {
+test('alpha.1 live transition leaves the stock model-selection directory untouched', () => {
   const harness = alphaHarness()
   harness.loader.load({
     id: '@deepseek-ai/dsh-client-ui-model-selection',
     factory() {
       return {
+        inject: ['commandUi', 'connection', 'locale', 'sessions', 'slots', 'remote'],
         apply(ctx) {
           const directory = ctx.modelDirectories.directoryFor('chat')
           ctx.observed = directory.store.getSnapshot()
@@ -349,6 +348,10 @@ test('alpha.1 live transition keeps stock model selector visibility projection',
   })
   const spec = harness.live.get('@deepseek-ai/dsh-client-ui-model-selection')
   const plugin = spec.factory(() => ({}))
+  // The retired model-visibility boundary used to wrap this plugin with a
+  // projected directory and append settingsScope to its inject list. After the
+  // P5 retirement there is no wrapper at all.
+  assert.equal(plugin.apply.__visionRouterModelVisibility, undefined)
   const raw = {
     groups: [
       { id: 'deepseek-official', name: 'DeepSeek', models: [{ id: 'deepseek-v4' }] },
@@ -377,6 +380,16 @@ test('alpha.1 live transition keeps stock model selector visibility projection',
     },
   }
   plugin.apply(observedCtx)
-  assert.deepEqual(observedCtx.observed.groups.map((group) => group.id), ['deepseek-official'])
-  assert.equal(observedCtx.observed.current.provider, 'deepseek-official')
+  assert.equal(observedCtx.observed, raw, 'the stock model-selection plugin must see the raw directory by identity')
+  assert.deepEqual(
+    raw.groups.map((group) => group.id),
+    ['deepseek-official', 'deepseek-vision'],
+    'no client-side projection may hide catalog rows anymore',
+  )
+  assert.equal(raw.current.provider, 'deepseek-vision')
+  assert.deepEqual(
+    plugin.inject,
+    ['commandUi', 'connection', 'locale', 'sessions', 'slots', 'remote'],
+    'nothing may append settingsScope to the stock plugin declaration',
+  )
 })

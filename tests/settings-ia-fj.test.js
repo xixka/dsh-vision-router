@@ -205,7 +205,7 @@ test('H1: Advanced network copy makes DSH/Host the default egress authority', ()
   assert.doesNotMatch(SETTINGS_IA_CLIENT_PRELUDE, /Leave empty to disable/)
 })
 
-test('G: onboarding copy teaches the composer Vision control instead of wrapper groups', () => {
+test('G: onboarding copy teaches the /vision command instead of the retired composer control', () => {
   const dictionaries = {
     zh: {
       quickStartBody: 'old',
@@ -220,12 +220,20 @@ test('G: onboarding copy teaches the composer Vision control instead of wrapper 
   }
   const { defined } = harness({ localeDictionaries: dictionaries })
   assert.equal(defined.namespace, 'vision-router')
-  assert.match(defined.dictionaries.zh.quickStartBody, /👁 识图/)
-  assert.match(defined.dictionaries.zh.onboardingStep1Body, /👁 识图/)
+  assert.match(defined.dictionaries.zh.quickStartBody, /\/vision on/)
+  assert.match(defined.dictionaries.zh.onboardingStep1Body, /\/vision <问题>/)
+  assert.match(defined.dictionaries.zh.guideStep1Body, /\/vision on/)
   assert.match(defined.dictionaries.zh.onboardingStep2Body, /Vision Router → 常规/)
   assert.match(defined.dictionaries.zh.onboardingStep3Title, /可选/)
-  assert.match(defined.dictionaries.en.quickStartBody, /👁 Vision/)
-  assert.doesNotMatch(defined.dictionaries.zh.quickStartBody, /\+ 自动识图/)
+  assert.match(defined.dictionaries.en.quickStartBody, /\/vision on/)
+  assert.match(defined.dictionaries.en.onboardingStep1Body, /\/vision <question>/)
+  for (const body of [
+    defined.dictionaries.zh.quickStartBody,
+    defined.dictionaries.zh.onboardingStep1Body,
+    defined.dictionaries.zh.guideStep1Body,
+  ]) {
+    assert.doesNotMatch(body, /👁/)
+  }
 })
 
 test('J: Settings IA no longer relies on sibling-DOM hiding to suppress duplicate cards', () => {

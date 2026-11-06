@@ -6,11 +6,13 @@ import {
   resolveWrapperDirectoryEntry,
 } from '../lib/wrapper-directory.js'
 
+// P5 (plan §5.1-5) contract harness: the Host still exposes the full
+// configurable-provider directory API so the retirement assertions below prove
+// the plugin CHOOSES not to write it, rather than running on a host without it.
 function fakeContext({
   visionConfig = {},
   liveProviders = [
     { id: 'deepseek-official', name: 'DeepSeek' },
-    { id: 'deepseek-vision', name: 'DeepSeek + 自动识图' },
   ],
   configurableProviders = [
     {
@@ -20,11 +22,8 @@ function fakeContext({
       settingsPath: [],
     },
   ],
-  registerError,
 } = {}) {
   const listeners = new Map()
-  const disposals = []
-  const warns = []
   const state = {
     visionConfig,
     liveProviders: [...liveProviders],
@@ -32,9 +31,11 @@ function fakeContext({
     ownedDirectory: [],
     registerCalls: 0,
     replaceCalls: 0,
+    listenerEvents: 0,
   }
 
   const emit = (name, ...args) => {
+    state.listenerEvents += 1
     for (const listener of listeners.get(name) ?? []) listener(...args)
   }
 
@@ -50,23 +51,14 @@ function fakeContext({
     },
     registerConfigurableProviders(entries) {
       state.registerCalls += 1
-      if (registerError) throw registerError
       state.ownedDirectory = entries.map((entry) => ({ ...entry, settingsPath: [...entry.settingsPath] }))
-      // rc.7 emits this notification from the directory commit itself. The
-      // helper must not recurse into a second registration.
-      emit('llm/adapters-updated')
       const handle = () => {
         state.ownedDirectory = []
-        emit('llm/adapters-updated')
       }
       handle.replace = (next) => {
         state.replaceCalls += 1
         state.ownedDirectory = next.map((entry) => ({ ...entry, settingsPath: [...entry.settingsPath] }))
-        emit('llm/adapters-updated')
       }
-      // Real DSH registerConfigurableProviders() internally binds this handle
-      // to the caller fiber through Cordis. Mirror that service ownership here.
-      disposals.push(handle)
       return handle
     },
   }
@@ -88,24 +80,18 @@ function fakeContext({
     },
     effect(factory) {
       const cleanup = factory()
-      disposals.push(cleanup)
-      return () => {}
+      return () => (typeof cleanup === 'function' ? cleanup() : undefined)
     },
-    logger: { warn(message) { warns.push(message) } },
+    logger: { warn() {} },
   }
 
-  return {
-    ctx,
-    state,
-    emit,
-    warns,
-    dispose() {
-      for (const cleanup of disposals.splice(0)) cleanup()
-    },
-  }
+  return { ctx, state, emit, listeners }
 }
 
-test('resolves DeepSeek + auto-vision as an alias of the official provider settings', () => {
+test('historical reader resolves the retired wrapper identity without a live wrapper adapter', () => {
+  // P5 semantic change: the wrapper route is never registered, so live
+  // topology only names official DeepSeek. Historical sessions, exports,
+  // compaction and replay must still resolve what the route always was.
   const { ctx } = fakeContext()
   assert.deepEqual(resolveWrapperDirectoryEntry(ctx), {
     provider: 'deepseek-vision',
@@ -115,58 +101,37 @@ test('resolves DeepSeek + auto-vision as an alias of the official provider setti
   })
 })
 
-test('publishes the wrapper into the rc.7 configurable-provider directory exactly once', () => {
-  const { ctx, state } = fakeContext()
-  installWrapperDirectoryAlias(ctx)
-
-  assert.equal(state.registerCalls, 1)
-  assert.equal(state.replaceCalls, 0)
-  assert.deepEqual(state.ownedDirectory, [
-    {
-      provider: 'deepseek-vision',
-      displayName: 'DeepSeek + 自动识图',
-      settingsNs: 'llm-deepseek',
-      settingsPath: [],
+test('historical reader follows a persisted custom wrapper name but never relabels it via textProvider', () => {
+  const { ctx } = fakeContext({
+    visionConfig: {
+      wrapperRoute: 'relay-auto-vision',
+      textProvider: { provider: 'openrouter' },
     },
-  ])
-})
-
-test('tracks a custom wrapper route but never aliases arbitrary textProvider settings', () => {
-  const { ctx, state, emit } = fakeContext()
-  installWrapperDirectoryAlias(ctx)
-
-  state.visionConfig = {
-    wrapperRoute: 'relay-auto-vision',
-    textProvider: { provider: 'openrouter' },
-  }
-  state.liveProviders = [
-    { id: 'deepseek-official', name: 'DeepSeek' },
-    { id: 'openrouter', name: 'OpenRouter' },
-    { id: 'relay-auto-vision', name: 'DeepSeek + 自动识图' },
-  ]
-  state.sourceDirectory.push({
-    provider: 'openrouter',
-    displayName: 'OpenRouter',
-    settingsNs: 'llm-pi-ai',
-    settingsPath: ['providers', 'openrouter'],
+    configurableProviders: [
+      {
+        provider: 'openrouter',
+        displayName: 'OpenRouter',
+        settingsNs: 'llm-pi-ai',
+        settingsPath: ['providers', 'openrouter'],
+      },
+      {
+        provider: 'deepseek-official',
+        displayName: 'DeepSeek',
+        settingsNs: 'llm-deepseek',
+        settingsPath: [],
+      },
+    ],
   })
-
-  emit('settings/updated', 'vision-router', state.visionConfig, {}, 'update')
-
-  assert.equal(state.registerCalls, 1)
-  assert.equal(state.replaceCalls, 1)
-  assert.deepEqual(state.ownedDirectory, [
-    {
-      provider: 'relay-auto-vision',
-      displayName: 'DeepSeek + 自动识图',
-      settingsNs: 'llm-deepseek',
-      settingsPath: [],
-    },
-  ])
+  assert.deepEqual(resolveWrapperDirectoryEntry(ctx), {
+    provider: 'relay-auto-vision',
+    displayName: 'DeepSeek + 自动识图',
+    settingsNs: 'llm-deepseek',
+    settingsPath: [],
+  })
 })
 
-test('does not publish the DeepSeek-labelled wrapper when official DeepSeek has no settings address', () => {
-  const { ctx, state } = fakeContext({
+test('historical reader fails closed when official DeepSeek has no settings address', () => {
+  const { ctx } = fakeContext({
     visionConfig: { textProvider: { provider: 'openrouter' } },
     configurableProviders: [
       {
@@ -177,107 +142,72 @@ test('does not publish the DeepSeek-labelled wrapper when official DeepSeek has 
       },
     ],
   })
-  installWrapperDirectoryAlias(ctx)
-  assert.equal(state.registerCalls, 0)
-  assert.deepEqual(state.ownedDirectory, [])
+  assert.equal(resolveWrapperDirectoryEntry(ctx), undefined)
 })
 
-test('does not publish a phantom Models row when the wrapper adapter is not live', () => {
-  const { ctx, state } = fakeContext({
-    liveProviders: [{ id: 'deepseek-official', name: 'DeepSeek' }],
-  })
-  installWrapperDirectoryAlias(ctx)
-  assert.equal(state.registerCalls, 0)
-  assert.deepEqual(state.ownedDirectory, [])
-})
-
-test('is a no-op on older LLM runtimes without the configurable-provider directory API', () => {
+test('historical reader is unavailable on runtimes without the directory read API', () => {
   const ctx = {
     llm: {
       listProviders: () => [],
     },
   }
-  assert.doesNotThrow(() => installWrapperDirectoryAlias(ctx))
   assert.equal(resolveWrapperDirectoryEntry(ctx), undefined)
 })
 
-test('disposes the directory alias with the plugin fiber and stays inert afterwards', () => {
-  const { ctx, state, emit, dispose } = fakeContext()
-  installWrapperDirectoryAlias(ctx)
-  assert.equal(state.registerCalls, 1)
-  assert.equal(state.ownedDirectory.length, 1)
-
-  dispose()
-  assert.deepEqual(state.ownedDirectory, [])
-
-  state.visionConfig = { wrapperRoute: 'relay-auto-vision' }
-  state.liveProviders.push({ id: 'relay-auto-vision', name: 'DeepSeek + 自动识图' })
-  emit('settings/updated', 'vision-router', state.visionConfig, {}, 'update')
-
-  assert.equal(state.registerCalls, 1)
+test('retired installer never writes the directory on a Host that exposes it', () => {
+  const { ctx, state, emit } = fakeContext()
+  const dispose = installWrapperDirectoryAlias(ctx, {}, ctx.logger)
+  assert.equal(state.registerCalls, 0)
   assert.equal(state.replaceCalls, 0)
   assert.deepEqual(state.ownedDirectory, [])
-})
 
-test('re-registers cleanly after a fiber reload instead of freezing on the stale row', () => {
-  const { ctx, state, dispose } = fakeContext()
-  installWrapperDirectoryAlias(ctx)
-  dispose()
-
-  // Same context object, fresh install: the reloaded instance must see an
-  // empty directory (the old row was disposed with the fiber) and publish.
-  installWrapperDirectoryAlias(ctx)
-  assert.equal(state.registerCalls, 2)
-  assert.equal(state.ownedDirectory.length, 1)
-  assert.equal(state.ownedDirectory[0].provider, 'deepseek-vision')
-})
-
-test('withdrawal records the empty-state key and skips redundant replaces', () => {
-  const { ctx, state, emit } = fakeContext()
-  installWrapperDirectoryAlias(ctx)
-  assert.equal(state.ownedDirectory[0].provider, 'deepseek-vision')
-
-  // An external owner takes over a NEW route the settings now point at.
+  // Settings and adapter-topology events must not resurrect any publication.
   state.visionConfig = { wrapperRoute: 'relay-auto-vision' }
-  state.liveProviders.push({ id: 'relay-auto-vision', name: 'DeepSeek + 自动识图' })
-  state.sourceDirectory.push({
-    provider: 'relay-auto-vision',
-    displayName: 'External',
-    settingsNs: 'external-ns',
-    settingsPath: [],
-  })
   emit('settings/updated', 'vision-router', state.visionConfig, {}, 'update')
-  assert.equal(state.replaceCalls, 1)
-  assert.deepEqual(state.ownedDirectory, [])
-
-  // The wrapper disappears entirely: the cached empty-state key must make
-  // this a no-op rather than a second redundant replace.
-  state.liveProviders = []
+  emit('settings/document-updated', 'vision-router')
   emit('llm/adapters-updated')
-  assert.equal(state.replaceCalls, 1)
-})
-
-test('deduplicates identical sync warnings across repeated adapter events', () => {
-  const error = new Error('already declared')
-  error.code = 'DUPLICATE_DIRECTORY'
-  const { ctx, emit, warns } = fakeContext({ registerError: error })
-  installWrapperDirectoryAlias(ctx)
-  emit('llm/adapters-updated')
-  emit('llm/adapters-updated')
-
-  assert.equal(warns.length, 1)
-  assert.match(warns[0], /Models-directory alias sync failed/)
-})
-
-
-test('effect registration failure prevents Models-directory admission entirely', () => {
-  const { ctx, state } = fakeContext()
-  ctx.effect = () => { throw new Error('inactive fiber') }
-  ctx.on = () => assert.fail('an unowned generation must not register event listeners')
-  installWrapperDirectoryAlias(ctx)
   assert.equal(state.registerCalls, 0)
   assert.deepEqual(state.ownedDirectory, [])
-  state.visionConfig = { wrapperRoute: 'relay-auto-vision' }
-  assert.doesNotThrow(() => installWrapperDirectoryAlias(ctx))
+
+  // The disposer stays callable and idempotent.
+  assert.doesNotThrow(() => dispose())
+  assert.doesNotThrow(() => dispose())
+  assert.equal(state.registerCalls, 0)
+})
+
+test('retired installer registers no listeners and is generation-inert', () => {
+  const { ctx, state, listeners, emit } = fakeContext()
+  installWrapperDirectoryAlias(ctx, {}, ctx.logger)
+  installWrapperDirectoryAlias(ctx, {}, ctx.logger)
+  assert.equal(state.registerCalls, 0)
+  assert.equal(state.listenerEvents, 0)
+  assert.deepEqual([...listeners.entries()].map(([name]) => name), [])
+
+  emit('llm/adapters-updated')
+  emit('settings/updated', 'vision-router', {}, {}, 'update')
+  assert.equal(state.registerCalls, 0)
+  assert.equal(state.replaceCalls, 0)
+})
+
+test('retired installer is safe on contexts without any llm surface', () => {
+  const ctx = {}
+  let dispose
+  assert.doesNotThrow(() => {
+    dispose = installWrapperDirectoryAlias(ctx, {}, undefined)
+  })
+  assert.doesNotThrow(() => dispose())
+})
+
+test('retired installer never reads live topology to decide publication', () => {
+  // The old runtime withdrew/published rows based on live adapter state; the
+  // retirement must not depend on it in either direction.
+  const { ctx, state } = fakeContext({
+    liveProviders: [
+      { id: 'deepseek-official', name: 'DeepSeek' },
+      { id: 'deepseek-vision', name: 'DeepSeek + 自动识图' },
+    ],
+  })
+  installWrapperDirectoryAlias(ctx, {}, ctx.logger)
+  assert.equal(state.registerCalls, 0)
   assert.deepEqual(state.ownedDirectory, [])
 })

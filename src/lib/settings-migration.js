@@ -5,6 +5,16 @@ export const RETIRED_SETTINGS_FIELDS = Object.freeze([
   'visionGuideStep',
   'instantDescribe',
   'localDescribeStyle',
+  // P5 (plan §4.5): the wrapper-era routing fields are migration-readable
+  // profile data only. The read-only schema still parses them so old profiles
+  // resolve identically; unsetting them from the user layer here means the new
+  // settings UI never shows them again and no runtime path re-reads a stale
+  // value from the stored layer.
+  'autoWrapProviders',
+  'wrappedProviders',
+  'wrapperRoute',
+  'chainRoute',
+  'stealth',
 ])
 
 function isObject(value) {

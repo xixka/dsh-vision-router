@@ -72,7 +72,6 @@ test('direct tapIndex client installers are restricted to reviewed carrier owner
     ['settings-client-017-compat.js', 'owns its structured Desktop row explicitly'],
     ['settings-factory-lifecycle.js', 'owns custom structured script/style convergence'],
     ['v2-settings-ia-integration.js', 'owns custom structured script/style convergence'],
-    ['vision-toggle-root-hardening.js', 'rewrites structured scripts plus HTML fallback'],
   ])
 
   const direct = files.filter((path) => readFileSync(path, 'utf8').includes('tapIndex('))

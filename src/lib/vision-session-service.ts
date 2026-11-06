@@ -139,13 +139,29 @@ export interface VisionSessionServiceDeps {
   readonly listBackends?: () => readonly string[]
 }
 
+/** The routing coordinator's lease-revocation surface consumed by /vision off. */
+export interface VisionRouteLeaseRevoker {
+  /** Revoke a not-yet-executed live lease and restore its saved origin selection. */
+  revokePendingRouteLease(agent: unknown): boolean
+  /** Clear a not-yet-executed persisted lease for a cold Session. */
+  revokePersistedRouteLease(session: unknown): boolean
+}
+
 export interface VisionSessionService {
   getStatus(sessionId: string): Promise<VisionSessionStatus>
+  /**
+   * Register the routing coordinator's lease revoker once composition wiring
+   * can reach it; /vision off then also revokes DVR's not-yet-executed route
+   * ownership (plan §3.1) in addition to persisting the disabled policy.
+   */
+  registerRouteLeaseRevoker(revoker: VisionRouteLeaseRevoker): void
   setMode(input: {
     readonly sessionId: string
     readonly enabled: boolean
     readonly origin: string
     readonly signal?: AbortSignal
+    /** Live Agent; /vision off uses it to revoke a pending route lease. */
+    readonly agent?: unknown
   }): Promise<SessionVisionPolicyUpdateOutcome>
   submitVisionTask(input: {
     readonly agent: unknown
@@ -178,6 +194,7 @@ export function createVisionSessionService(deps: VisionSessionServiceDeps): Visi
   }
   const store = deps.store
   const pendingSubmissions = new Set<string>()
+  let routeLeaseRevoker: VisionRouteLeaseRevoker | undefined
 
   const readCurrentPolicy = async (
     sessionId: string,
@@ -249,6 +266,10 @@ export function createVisionSessionService(deps: VisionSessionServiceDeps): Visi
   }
 
   return {
+    registerRouteLeaseRevoker(revoker) {
+      routeLeaseRevoker = revoker
+    },
+
     async getStatus(sessionId) {
       const policy = await readCurrentPolicy(sessionId)
       const durability = storeDurabilityOf(store)
@@ -278,11 +299,32 @@ export function createVisionSessionService(deps: VisionSessionServiceDeps): Visi
         throw new TypeError('Vision session setMode requires a non-empty sessionId')
       }
       throwIfVisionCancelled(input?.signal)
-      return await applySessionVisionPolicyUpdate(store, sessionId, {
+      const outcome = await applySessionVisionPolicyUpdate(store, sessionId, {
         enabled: input.enabled === true,
         source: 'user',
         origin: input.origin,
       })
+      if (input.enabled === false && input.agent !== undefined && routeLeaseRevoker !== undefined) {
+        // /vision off (plan §3.1) also revokes DVR's not-yet-executed route
+        // ownership: restore the saved origin selection and clear the durable
+        // lease. Best-effort by design — a revoke failure never fails off,
+        // and the coordinator's next text-turn restore still self-heals.
+        const revoker = routeLeaseRevoker
+        try {
+          revoker.revokePendingRouteLease(input.agent)
+          const session = (input.agent as { session?: unknown })?.session
+          if (session !== undefined && session !== null) revoker.revokePersistedRouteLease(session)
+        } catch (error) {
+          try {
+            deps.logger?.warn?.(
+              'vision-router: /vision off route lease revoke failed for session %s: %s',
+              sessionId,
+              error instanceof Error ? error.message : String(error),
+            )
+          } catch {}
+        }
+      }
+      return outcome
     },
 
     async submitVisionTask(input) {

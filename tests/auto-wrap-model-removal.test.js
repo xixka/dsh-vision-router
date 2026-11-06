@@ -3,6 +3,10 @@ import assert from 'node:assert/strict'
 
 import { apply, Config } from '../index.js'
 
+// P5 (plan §4.2/§4.5) contract harness: a full legacy profile shape (auto-wrap
+// on, wrapped providers, wrapper/chain routes, whole-turn routing) applied to
+// a Host whose llm registry already serves a real provider. Every counter
+// below records a MODEL-DIRECTORY WRITE the plugin could have made before P5.
 function autoWrapHarness() {
   const adapters = new Map()
   const registrations = new Map()
@@ -67,7 +71,7 @@ function autoWrapHarness() {
         return registration
       },
       registerConfigurableProviders() {
-        return { replace() {} }
+        throw new Error('P5: the plugin must not write the configurable-provider directory')
       },
       listProviders() {
         return [...registrations.entries()].map(([provider, registration]) => {
@@ -101,45 +105,66 @@ function autoWrapHarness() {
   return { ctx, adapters, listeners }
 }
 
-test('auto-wrap drops a model after the source catalog removes it', async () => {
-  const { ctx, adapters } = autoWrapHarness()
-  let sourceModels = ['model-a', 'model-b']
-  const source = {
-    providerInfo: (provider) => ({ id: provider, name: 'Mutable Provider' }),
-    providerRetryPolicy: () => undefined,
-    listModels: async (provider) =>
-      sourceModels.map((id) => ({ provider, id, name: id, inputModalities: ['text'] })),
-    resolveModel: async (provider, model) => {
-      if (!sourceModels.includes(model)) throw new Error(`unknown model: ${model}`)
-      return { provider, id: model, name: model, inputModalities: ['text'] }
-    },
-    stream: async function* () {
-      yield { type: 'finish', reason: { kind: 'stop' } }
+const mutableSource = () => {
+  const sourceModels = ['model-a', 'model-b']
+  return {
+    sourceModels,
+    adapter: {
+      providerInfo: (provider) => ({ id: provider, name: 'Mutable Provider' }),
+      providerRetryPolicy: () => undefined,
+      listModels: async (provider) =>
+        sourceModels.map((id) => ({ provider, id, name: id, inputModalities: ['text'] })),
+      resolveModel: async (provider, model) => {
+        if (!sourceModels.includes(model)) throw new Error(`unknown model: ${model}`)
+        return { provider, id: model, name: model, inputModalities: ['text'] }
+      },
+      stream: async function* () {
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
     },
   }
+}
 
-  ctx.llm.registerAdapter(['mutable-provider'], source)
+test('legacy auto-wrap profile is runtime-inert: no twin, wrapper, chain or vision-http route registers', () => {
+  const { ctx, adapters } = autoWrapHarness()
+  const source = mutableSource()
+
+  ctx.llm.registerAdapter(['mutable-provider'], source.adapter)
+  apply(
+    ctx,
+    Config({
+      autoWrapProviders: true,
+      wrappedProviders: [{ provider: 'mutable-provider', models: [] }],
+      wrapperRoute: 'deepseek-vision',
+      chainRoute: 'vision-chain',
+      routing: true,
+    }),
+  )
+
+  // The only registered adapter is the harness-owned source. The legacy
+  // auto-wrap/wrapped/wrapper/chain fields registered nothing at all.
+  assert.deepEqual([...adapters.keys()], ['mutable-provider'])
+  assert.equal(adapters.has('mutable-provider-vision'), false, 'no auto-vision twin')
+  assert.equal(adapters.has('deepseek-vision'), false, 'no wrapper route')
+  assert.equal(adapters.has('vision-chain'), false, 'no chain route')
+  assert.equal(adapters.has('vision-http'), false, 'no vision-http pseudo provider')
+
+  // A source catalog removal can never strand a stale twin: there is no
+  // registered mirror route whose snapshot could go stale.
+  source.sourceModels.splice(1)
+  assert.equal(adapters.has('mutable-provider-vision'), false)
+})
+
+test('read-only registry access keeps working after the zero-Provider surgery', async () => {
+  const { ctx, adapters } = autoWrapHarness()
+  const source = mutableSource()
+
+  ctx.llm.registerAdapter(['mutable-provider'], source.adapter)
   apply(ctx, Config({ autoWrapProviders: true }))
 
-  const twin = adapters.get('mutable-provider-vision')
-  assert.ok(twin, 'expected the source provider to get an auto-vision twin')
-  assert.deepEqual(
-    (await twin.listModels('mutable-provider-vision')).map((model) => model.id),
-    ['model-a', 'model-b'],
-  )
-
-  // Simulate Settings -> Models removing one row while the provider route stays
-  // live. The already-registered twin must consult the source catalog again;
-  // it must not retain a model snapshot captured when the twin was created.
-  sourceModels = ['model-a']
-
-  assert.strictEqual(adapters.get('mutable-provider-vision'), twin)
-  assert.deepEqual(
-    (await twin.listModels('mutable-provider-vision')).map((model) => model.id),
-    ['model-a'],
-  )
-  await assert.rejects(
-    () => twin.resolveModel('mutable-provider-vision', 'model-b'),
-    /unknown model: model-b/,
-  )
+  // ctx.llm.registration()/resolveModelInfo() remain usable read-only seams.
+  assert.equal(ctx.llm.registration('mutable-provider').adapter, source.adapter)
+  const info = await ctx.llm.resolveModelInfo('mutable-provider', 'model-a')
+  assert.equal(info.id, 'model-a')
+  assert.equal(adapters.has('vision-http'), false)
 })

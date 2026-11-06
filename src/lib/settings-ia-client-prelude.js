@@ -51,26 +51,26 @@ export const SETTINGS_IA_CLIENT_PRELUDE = String.raw`(function(){
     var next=Object.assign({},dictionaries);
     if(next.zh&&typeof next.zh==='object')next.zh=Object.assign({},next.zh,{
       quickStartTitle:'聊天模型和识图模型分开设置',
-      quickStartBody:'聊天模型在聊天页选择；需要看图时点击输入框旁的「👁 识图」。这里仅设置负责读取图片的模型。',
-      onboardingBody:'第一次使用只需要记住：聊天模型在聊天页选择，需要看图时点击「👁 识图」；这里设置负责读取图片的模型。',
-      onboardingStep1Body:'在聊天页选择你平时使用的聊天模型。需要看图时点击输入框旁的「👁 识图」，不用寻找「+ 自动识图」模型。',
+      quickStartBody:'聊天模型在聊天页选择；需要看图时输入 /vision on 开启识图，或直接发送 /vision <问题> 并附上图片。这里仅设置负责读取图片的模型。',
+      onboardingBody:'第一次使用只需要记住：聊天模型在聊天页选择；需要看图时输入 /vision on，或直接发送 /vision <问题> 并附上图片；这里设置负责读取图片的模型。',
+      onboardingStep1Body:'在聊天页选择你平时使用的聊天模型。需要看图时输入 /vision on 开启识图，或直接发送 /vision <问题> 并附上图片，不用寻找「+ 自动识图」模型。',
       onboardingStep2Body:'打开「设置 → Vision Router → 常规」，选择负责读取图片的模型；也可以直接使用内置免费兜底。',
       onboardingStep3Title:'3 · 备用识图模型（可选）',
       onboardingStep3Body:'只有需要更高可用性时才添加备用模型；前一个失败时会自动尝试下一个，最后还可以使用内置免费兜底。',
-      guideStep1Body:'聊天页输入框旁的模型选择器和「👁 识图」已经高亮。选择你平时使用的聊天模型；需要看图时点击「👁 识图」。选好后点击「下一步」。',
+      guideStep1Body:'聊天页输入框旁的模型选择器已经高亮。选择你平时使用的聊天模型；需要看图时输入 /vision on，或直接发送 /vision <问题> 并附上图片。选好后点击「下一步」。',
       guidePromptNavBody:'在设置面板左侧点击被高亮的「Vision Router」入口（或点「下一步」自动进入），然后停留在「常规」页选择识图模型。',
       guideChainTitle:'最后 · 确认识图模型',
       guideChainBody:'这里的识图模型会从上到下依次尝试。备用模型完全可选；全部失败时仍可使用内置免费兜底。确认后保存即可。'
     });
     if(next.en&&typeof next.en==='object')next.en=Object.assign({},next.en,{
       quickStartTitle:'Choose chat and vision models separately',
-      quickStartBody:'Choose your chat model in the composer. When an image needs inspection, use the “👁 Vision” control beside the input. This page only chooses the models that read images.',
-      onboardingBody:'For first use, remember: choose the chat model in chat, use “👁 Vision” when an image needs inspection, and choose the image-reading model here.',
-      onboardingStep1Body:'Choose the chat model you normally use. When an image needs inspection, use the “👁 Vision” control beside the input; you do not need to look for a “+ Auto Vision” model.',
+      quickStartBody:'Choose your chat model in the composer. When an image needs inspection, run /vision on, or send /vision <question> with the image attached. This page only chooses the models that read images.',
+      onboardingBody:'For first use, remember: choose the chat model in chat; when an image needs inspection, run /vision on or send /vision <question> with the image attached; choose the image-reading model here.',
+      onboardingStep1Body:'Choose the chat model you normally use. When an image needs inspection, run /vision on, or send /vision <question> with the image attached; you do not need to look for a “+ Auto Vision” model.',
       onboardingStep2Body:'Open Settings → Vision Router → General and choose the model that reads images, or keep using the built-in free fallback.',
       onboardingStep3Title:'3 · Add fallback vision models (optional)',
       onboardingStep3Body:'Add fallbacks only when you want extra availability. If one fails, Vision Router tries the next and can still finish with the built-in free fallback.',
-      guideStep1Body:'The chat-model selector and “👁 Vision” control beside the input are highlighted. Choose your normal chat model and use “👁 Vision” when an image needs inspection. Click Next when ready.',
+      guideStep1Body:'The chat-model selector beside the input is highlighted. Choose your normal chat model; when an image needs inspection, run /vision on, or send /vision <question> with the image attached. Click Next when ready.',
       guidePromptNavBody:'Click the highlighted Vision Router entry in Settings (or press Next), then stay on General to choose the vision model.',
       guideChainTitle:'Final · Confirm the vision model',
       guideChainBody:'Vision models are tried from top to bottom. Fallback models are optional, and the built-in free fallback remains available at the end. Save when ready.'
@@ -262,7 +262,7 @@ export const SETTINGS_IA_CLIENT_PRELUDE = String.raw`(function(){
               '旧版 DSH：llm-pi-ai 使用 input: [text, image]；llm-deepseek 使用 inputModalities: [text, image]。只有模型本身支持图片时才这样配置。经验证的 HTTP Chat Completions 通道也可能直接桥接；单独添加视觉能力标记不能开启图片传输。',
               'Older DSH: llm-pi-ai uses input: [text, image]; llm-deepseek uses inputModalities: [text, image]. Only declare image input if the model supports it. Verified HTTP Chat Completions may bridge; a capability label alone cannot enable image delivery.')));
         }
-        return h(React.Fragment,null,title(tx('常规','General'),tx('这里只设置“谁负责看图”。聊天模型仍在聊天页选择。','This page only decides who reads images; the chat model is still chosen in chat.')),card([toggle('localOnlyVision',tx('仅本地视觉','Local-only vision'),tx('只使用本机识图模型；云端识图和免费兜底暂停，原配置保留。识图结果文字仍可能发给云端聊天模型。只能在本机修改。','Use only local vision models; cloud vision and the free fallback are paused without deleting settings. Result text may still go to a cloud chat model. Change this only on the local DSH machine.'),!local),h('div',{className:'vr-ia-status',key:'status'},h('strong',null,(activeLocalOnly?'🔒 ':localOnlyPending?'⚠ ':configured.length||fallback?'● ':'⚠ ')+status),h('p',{className:'vr-hint'},tx('需要看图时，在聊天框旁点击「👁 识图」。','Use “👁 Vision” beside the chat box when an image needs inspection.')),egressNotice(activeLocalOnly,local),localOnlyPending?h('p',{className:localOnly?'vr-failed':'vr-hint',key:'local-only-pending'},localOnly?tx('尚未生效：请点击页面底部「保存」。保存前图片仍可能上传。','Not active yet: select Save at the bottom. Images may still be uploaded until saved.'):tx('还没有保存：当前仍在仅本地视觉模式，保存后才会允许云端识图。','Not saved yet: Local-only vision remains active until you save.')):null,ordered.length?h('p',{className:'vr-ia-chain-summary'},ordered.join(' → ')):null,stale.length?h('p',{className:'vr-failed'},tx('有已保存的识图模型当前不在可调用目录中；请到“诊断”重新检测。','A saved vision model is not currently in the callable catalog; re-detect it in Diagnostics.')):null)]),card([h('div',{className:'vr-field',id:'vr-vision-backend-chain','data-vr-guide-target':'vision-backend',key:'chain'},fieldHead('providers',tx('识图模型','Vision models')),h('p',{className:'vr-hint'},tx('从上到下依次尝试；前一个失败时自动切换到下一个。','Models are tried from top to bottom and fall through automatically on failure.')),rows.map(function(row,index){return modelRow(row,index,rows,setChainDraft,false);}),
+        return h(React.Fragment,null,title(tx('常规','General'),tx('这里只设置“谁负责看图”。聊天模型仍在聊天页选择。','This page only decides who reads images; the chat model is still chosen in chat.')),card([toggle('localOnlyVision',tx('仅本地视觉','Local-only vision'),tx('只使用本机识图模型；云端识图和免费兜底暂停，原配置保留。识图结果文字仍可能发给云端聊天模型。只能在本机修改。','Use only local vision models; cloud vision and the free fallback are paused without deleting settings. Result text may still go to a cloud chat model. Change this only on the local DSH machine.'),!local),h('div',{className:'vr-ia-status',key:'status'},h('strong',null,(activeLocalOnly?'🔒 ':localOnlyPending?'⚠ ':configured.length||fallback?'● ':'⚠ ')+status),h('p',{className:'vr-hint'},tx('需要看图时，输入 /vision on 开启识图。','Run /vision on when an image needs inspection.')),egressNotice(activeLocalOnly,local),localOnlyPending?h('p',{className:localOnly?'vr-failed':'vr-hint',key:'local-only-pending'},localOnly?tx('尚未生效：请点击页面底部「保存」。保存前图片仍可能上传。','Not active yet: select Save at the bottom. Images may still be uploaded until saved.'):tx('还没有保存：当前仍在仅本地视觉模式，保存后才会允许云端识图。','Not saved yet: Local-only vision remains active until you save.')):null,ordered.length?h('p',{className:'vr-ia-chain-summary'},ordered.join(' → ')):null,stale.length?h('p',{className:'vr-failed'},tx('有已保存的识图模型当前不在可调用目录中；请到“诊断”重新检测。','A saved vision model is not currently in the callable catalog; re-detect it in Diagnostics.')):null)]),card([h('div',{className:'vr-field',id:'vr-vision-backend-chain','data-vr-guide-target':'vision-backend',key:'chain'},fieldHead('providers',tx('识图模型','Vision models')),h('p',{className:'vr-hint'},tx('从上到下依次尝试；前一个失败时自动切换到下一个。','Models are tried from top to bottom and fall through automatically on failure.')),rows.map(function(row,index){return modelRow(row,index,rows,setChainDraft,false);}),
         readiness.filter(function(entry){return !localOnly&&(caps.status==='ready'||caps.status==='error')&&entry.state!=='evidence';}).map(function(entry,index){return h('div',{
           className:'vr-field',key:'readiness-'+index,'data-vr-model-readiness':entry.state
         },h('p',{className:entry.state==='text-only'||entry.state==='blocked'?'vr-failed':'vr-hint'},

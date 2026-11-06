@@ -503,6 +503,36 @@ test('the walkthrough is an explicit state machine with visual fallbacks for all
   assert.equal(source.includes('const halo = 10'), true)
 })
 
+test('onboarding and guide copy teach the /vision command, never the retired composer button', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  // The retired button world taught “+ 自动识图” model groups or the “👁 识图”
+  // chip; the /vision world teaches the command surface (plan §2/§3.1).
+  assert.match(source, /\/vision on 开启识图/)
+  assert.match(source, /\/vision <问题> 并附上图片/)
+  assert.match(source, /run \/vision on/)
+  assert.match(source, /send \/vision <question> with the image attached/)
+  for (const stale of [
+    '在聊天页选择带「+ 自动识图」的模型即可',
+    '需要发图片时，请选择带「+ 自动识图」的版本',
+    '发图片时请选择带「+ 自动识图」的版本',
+    'choose a model marked “+ Auto Vision” in chat',
+    'For images, choose its “+ Auto Vision” version',
+    'pick a group marked “+ Auto Vision”',
+  ]) {
+    assert.equal(source.includes(stale), false, `client bundle must not teach the retired button world: ${stale}`)
+  }
+  // The settings-IA prelude patches the same dictionaries at runtime; it must
+  // teach the command too, not the retired chip.
+  const iaSource = readFileSync(new URL('../lib/settings-ia-client-prelude.js', import.meta.url), 'utf8')
+  assert.match(iaSource, /\/vision on/)
+  assert.equal(iaSource.includes('👁 识图'), false)
+  assert.equal(iaSource.includes('“👁 Vision”'), false)
+  // The composer teaching lives on only through the command: no slot chip
+  // registration may ship in the client bundle itself.
+  assert.equal(source.includes('vision-router-mode-toggle'), false)
+  assert.equal(source.includes('conversation.input.right'), false)
+})
+
 test('manual update help uses a dedicated vertical command card and never falls back to bare update', () => {
   const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
   assert.equal(source.includes("className: 'vr-update-manual'"), true)

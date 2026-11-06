@@ -534,3 +534,50 @@ test('configured main wrapper route is excluded from generated-twin interception
   privateCtx.llm.registerAdapter(['deepseek-vision'], main)
   assert.equal(harness.registrations.get('deepseek-vision').adapter, main)
 })
+
+// ── P5 migration semantics (plan §4.5): the retired auto-wrap/wrapped fields
+// no longer materialize any route, so generated-twin interception stays keyed
+// purely on '<provider>-vision' route names — the legacy settings can never
+// widen it to a plain provider route.
+
+test('P5: retired auto-wrap settings never make a plain provider route a generated twin', () => {
+  const registrations = new Map()
+  const plainAdapter = {
+    async resolveModel() {
+      return { id: 'm', inputModalities: ['text'] }
+    },
+    async *stream() {
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  const ctx = {
+    get() {
+      return {
+        get: (ns) => (ns === 'vision-router'
+          ? {
+              autoWrapProviders: true,
+              wrappedProviders: [{ provider: 'plain-provider', models: [] }],
+            }
+          : undefined),
+      }
+    },
+    llm: {
+      registerAdapter(providers, adapter) {
+        for (const provider of providers) registrations.set(provider, { adapter })
+        return () => {}
+      },
+      registration(provider) {
+        const hit = registrations.get(provider)
+        if (!hit) throw new Error(`no adapter ${provider}`)
+        return hit
+      },
+    },
+  }
+  const wrapped = contextWithTwinImageCapabilityFallback(ctx)
+  wrapped.llm.registerAdapter(['plain-provider'], plainAdapter)
+  assert.equal(
+    registrations.get('plain-provider').adapter,
+    plainAdapter,
+    'a plain route never enters generated-twin ownership, whatever the retired settings say',
+  )
+})

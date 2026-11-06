@@ -1,195 +1,20 @@
 import { injectClientCarrierHtml, installClientScriptCarriers } from './client-script-carrier.js'
 const CLIENT_PRESENTATION_MARK = 'data-vision-router-presentation-boundary'
-const VISION_MODE_WRAPPER_SOURCE = 'deepseek-official'
-
-function visionModeGroup(groups, id) {
-  if (!Array.isArray(groups) || typeof id !== 'string' || id === '') return undefined
-  return groups.find((group) => group && group.id === id)
-}
-
-function visionModeHasModel(group, modelId) {
-  return !!group && Array.isArray(group.models) && group.models.some(
-    (model) => model && model.id === modelId,
-  )
-}
-
-function visionModePairMatches(groups, sourceProvider, targetProvider, modelId, targetName) {
-  const source = visionModeGroup(groups, sourceProvider)
-  const target = visionModeGroup(groups, targetProvider)
-  if (!source || !target) return false
-  if (!visionModeHasModel(source, modelId) || !visionModeHasModel(target, modelId)) return false
-  return target.name === targetName
-}
-
-function visionModeHasOwn(config, key) {
-  return !!config && typeof config === 'object' && Object.prototype.hasOwnProperty.call(config, key)
-}
-
-function visionModeTwinIntended(config, sourceProvider, modelId) {
-  if (!config || typeof config !== 'object') return true
-  const entries = Array.isArray(config.wrappedProviders) ? config.wrappedProviders : []
-  const explicit = entries.find((entry) => entry && entry.provider === sourceProvider)
-  if (explicit) {
-    const models = Array.isArray(explicit.models) ? explicit.models : []
-    return models.length === 0 || models.includes(modelId)
-  }
-  return config.autoWrapProviders !== false
-}
-
-function visionModeOwnedTwin(groups, sourceProvider, twinProvider, modelId, config) {
-  if (twinProvider !== `${sourceProvider}-vision`) return false
-  // Keep client ownership identical to the core adapter registry: Vision Router
-  // never generates a twin from a source route that already ends in "-vision".
-  if (sourceProvider.endsWith('-vision')) return false
-  if (!visionModeTwinIntended(config, sourceProvider, modelId)) return false
-  const source = visionModeGroup(groups, sourceProvider)
-  if (!source) return false
-  const sourceName = typeof source.name === 'string' && source.name !== '' ? source.name : sourceProvider
-  return visionModePairMatches(
-    groups,
-    sourceProvider,
-    twinProvider,
-    modelId,
-    `${sourceName} + 自动识图`,
-  )
-}
-
-function visionModeConfiguredWrapperRoute(config) {
-  const route = config && typeof config.wrapperRoute === 'string' ? config.wrapperRoute.trim() : ''
-  return route || undefined
-}
-
-function visionModeWrapperRoute(groups, config, modelId) {
-  const configured = visionModeConfiguredWrapperRoute(config)
-  if (visionModeHasOwn(config, 'wrapperRoute')) return configured
-  const source = visionModeGroup(groups, VISION_MODE_WRAPPER_SOURCE)
-  if (!source) return undefined
-  const sourceName = typeof source.name === 'string' && source.name !== ''
-    ? source.name
-    : VISION_MODE_WRAPPER_SOURCE
-  const expectedName = `${sourceName} + 自动识图`
-  const candidates = Array.isArray(groups)
-    ? groups.filter((group) =>
-        group &&
-        group.id !== VISION_MODE_WRAPPER_SOURCE &&
-        group.name === expectedName &&
-        visionModeHasModel(group, modelId),
-      )
-    : []
-  return candidates.length === 1 ? candidates[0].id : undefined
-}
-
-function visionModeOwnedWrapper(groups, wrapperRoute, modelId) {
-  if (typeof wrapperRoute !== 'string' || wrapperRoute === '') return false
-  const source = visionModeGroup(groups, VISION_MODE_WRAPPER_SOURCE)
-  if (!source) return false
-  const sourceName = typeof source.name === 'string' && source.name !== ''
-    ? source.name
-    : VISION_MODE_WRAPPER_SOURCE
-  return visionModePairMatches(
-    groups,
-    VISION_MODE_WRAPPER_SOURCE,
-    wrapperRoute,
-    modelId,
-    `${sourceName} + 自动识图`,
-  )
-}
-
-function visionModeTarget(current, provider) {
-  return {
-    provider,
-    model: current.model,
-    ...(current.reasoningEffort === undefined ? {} : { reasoningEffort: current.reasoningEffort }),
-  }
-}
-
 /**
- * Derive the explicit composer vision-mode action from DSH's one authoritative
- * per-session model directory. There is deliberately no second boolean state:
- * a Vision Router wrapper means ON, its source route means OFF.
- *
- * DeepSeek is a deliberate special case: the built-in source
- * `deepseek-official` maps to the configured `wrapperRoute`. When that setting
- * is not visible to the browser (for example on a remote Web client), the
- * resolver accepts only one unambiguous DeepSeek + 自动识图 mirror from the
- * directory and otherwise fails closed. Other providers keep the generated
- * `<provider>-vision` contract and honor autoWrapProviders/wrappedProviders
- * when those settings are available.
- */
-export function resolveVisionModePair(groups, current, config = {}) {
-  if (
-    !current || typeof current !== 'object' ||
-    typeof current.provider !== 'string' || current.provider === '' ||
-    typeof current.model !== 'string' || current.model === ''
-  ) {
-    return { mode: 'unavailable' }
-  }
-
-  const wrapperRoute = visionModeWrapperRoute(groups, config, current.model)
-  if (current.provider === VISION_MODE_WRAPPER_SOURCE) {
-    if (!visionModeOwnedWrapper(groups, wrapperRoute, current.model)) {
-      return { mode: 'unavailable' }
-    }
-    return { mode: 'off', target: visionModeTarget(current, wrapperRoute) }
-  }
-
-  if (wrapperRoute && current.provider === wrapperRoute) {
-    if (!visionModeOwnedWrapper(groups, wrapperRoute, current.model)) {
-      return { mode: 'unavailable' }
-    }
-    return { mode: 'on', target: visionModeTarget(current, VISION_MODE_WRAPPER_SOURCE) }
-  }
-
-  if (current.provider.endsWith('-vision')) {
-    const sourceProvider = current.provider.slice(0, -'-vision'.length)
-    if (
-      sourceProvider &&
-      visionModeOwnedTwin(groups, sourceProvider, current.provider, current.model, config)
-    ) {
-      return { mode: 'on', target: visionModeTarget(current, sourceProvider) }
-    }
-    // Core excludes source routes ending in "-vision" from both auto and
-    // explicit twin registration. If this route is not a verified wrapper of
-    // another source, do not manufacture a nested "-vision-vision" pair.
-    return { mode: 'unavailable' }
-  }
-
-  const twinProvider = `${current.provider}-vision`
-  if (!visionModeOwnedTwin(groups, current.provider, twinProvider, current.model, config)) {
-    return { mode: 'unavailable' }
-  }
-  return { mode: 'off', target: visionModeTarget(current, twinProvider) }
-}
-
-const VISION_MODE_HELPER_SOURCE = [
-  visionModeGroup,
-  visionModeHasModel,
-  visionModePairMatches,
-  visionModeHasOwn,
-  visionModeTwinIntended,
-  visionModeOwnedTwin,
-  visionModeConfiguredWrapperRoute,
-  visionModeWrapperRoute,
-  visionModeOwnedWrapper,
-  visionModeTarget,
-  resolveVisionModePair,
-].map((fn) => fn.toString()).join('\n')
-
-/**
- * Browser prelude for the two compatibility surfaces still owned by the
+ * Browser prelude for the compatibility surface still owned by the
  * hand-maintained 1.7.x client factory.
  *
  * 1. DSH rc.8 made @deepseek-ai/dsh-client-ui-attachment a dynamic
- * presentation plugin and deliberately stopped exporting its React
- * implementation as package values. Vision Router therefore supplies its own
- * narrow ImageGallery value only to its own legacy factory.
+ *    presentation plugin and deliberately stopped exporting its React
+ *    implementation as package values. Vision Router therefore supplies its own
+ *    narrow ImageGallery value only to its own legacy factory.
  *
- * 2. Issue #284 adds a composer-side explicit Vision mode control. The control
- * does not own a boolean, watch images, or hook send lifecycle. It subscribes
- * to DSH's shared per-session ModelDirectory and switches only between an
- * ordinary provider/model and the matching Vision Router wrapper route. This
- * makes the stock model picker and the new affordance share one source of truth
- * while preserving manual model changes and reasoning effort.
+ * 2. The composer-side Vision mode toggle is retired (plan §5.2): Vision mode
+ *    is controlled exclusively by the /vision command. This boundary keeps only
+ *    the generic image surfaces — the ImageGallery value, the presented-card
+ *    focus helper, and the #138 clipboard image paste compatibility — and
+ *    deliberately registers no composer button, state chip, highlight, locale
+ *    override, or model-switch linkage.
  *
  * Rewriting the entire generated client artifact for either concern would
  * create a much larger compatibility diff. This boundary intercepts only the
@@ -200,10 +25,6 @@ export const CLIENT_PRESENTATION_PRELUDE = String.raw`(function(){
   'use strict';
   var TARGET = 'dsh-vision-router';
   var LEGACY_ATTACHMENT_VALUE = '@deepseek-ai/dsh-client-ui-attachment';
-  var VISION_MODE_NS = 'vision-router-mode';
-  var VISION_MODE_WRAPPER_SOURCE = 'deepseek-official';
-
-  ${VISION_MODE_HELPER_SOURCE}
 
   // #271 pre-release regression fence: #210 made the walkthrough runtime lazy,
   // but its document.body MutationObserver still invalidates the 250ms target
@@ -424,69 +245,6 @@ export const CLIENT_PRESENTATION_PRELUDE = String.raw`(function(){
     }
 
     return { ImageGallery: ImageGallery };
-  }
-
-  function patchVisionModeCopy(namespace, dictionaries) {
-    if (namespace !== 'vision-router' || !dictionaries || typeof dictionaries !== 'object') return dictionaries;
-    var next = Object.assign({}, dictionaries);
-    if (next.zh && typeof next.zh === 'object') {
-      next.zh = Object.assign({}, next.zh, {
-        quickStartTitle: '聊天模型 + 识图模式',
-        quickStartBody: '先选择你平时使用的聊天模型。需要看图时，点击输入框旁的「识图」；它变成选中态（高亮底色）表示已开启。开启后会持续生效；在同一模型组内切换到另一个支持识图模式的模型也会保持开启，直到你主动关闭或切到没有对应识图模式的普通模型。',
-        onboardingStep1Title: '1 · 选择聊天模型并开启识图',
-        onboardingStep1Body: '先在聊天页右下角选择你平时使用的模型。需要看图时，点击模型选择器左侧的「识图」；它变成选中态（高亮底色）表示已开启，不需要时再主动关闭。',
-        guideStep1Title: '第 1 步 · 选择聊天模型并认识「识图」',
-        guideStep1Body: '高亮的是聊天模型选择器；它左侧就是「识图」按钮。先选择你平时使用的聊天模型；需要看图时点击「识图」，它变成选中态（高亮底色）表示已开启。开启后会持续生效；在同一模型组内切换到另一个支持识图模式的模型也会保持开启，直到你主动关闭或切到没有对应识图模式的普通模型。选好后点击「下一步」。'
-      });
-    }
-    if (next.en && typeof next.en === 'object') {
-      next.en = Object.assign({}, next.en, {
-        quickStartTitle: 'Chat model + Vision mode',
-        quickStartBody: 'Choose the chat model you normally use first. When you need image understanding, click “Vision” beside the composer; the chip lights up in its selected state to mean it is on. It stays on when you switch to another Vision-enabled model in the same model group, until you turn it off or choose a normal model with no matching Vision route.',
-        onboardingStep1Title: '1 · Choose your chat model and enable Vision',
-        onboardingStep1Body: 'Choose the model you normally use from the lower-right chat selector. When you need image understanding, click “Vision” immediately to the left of the model selector; the chip lights up in its selected state to mean it is on. Turn it off again when you no longer need it.',
-        guideStep1Title: 'Step 1 · Choose your chat model and find “Vision”',
-        guideStep1Body: 'The highlighted control is the chat model selector; the “Vision” button is immediately to its left. Choose your normal chat model first, then click “Vision” when you need image understanding. The chip lights up in its selected state to mean it is on. It stays on when you switch to another Vision-enabled model in the same model group, until you turn it off or choose a normal model with no matching Vision route. Click “Next” when done.'
-      });
-    }
-    return next;
-  }
-
-  function contextWithVisionModeCopy(ctx) {
-    if (!ctx || typeof ctx !== 'object' || typeof Proxy !== 'function') return ctx;
-    var locale = ctx.locale;
-    if (!locale || (typeof locale !== 'object' && typeof locale !== 'function')) return ctx;
-    var wrappedLocale = new Proxy(locale, {
-      get: function(target, property) {
-        if (property === 'register') {
-          var register = Reflect.get(target, property, target);
-          if (typeof register !== 'function') return register;
-          return function(namespace, dictionaries) {
-            var rest = Array.prototype.slice.call(arguments, 2);
-            return register.apply(target, [namespace, patchVisionModeCopy(namespace, dictionaries)].concat(rest));
-          };
-        }
-        var value = Reflect.get(target, property, target);
-        return typeof value === 'function' ? value.bind(target) : value;
-      }
-    });
-    return new Proxy(ctx, {
-      get: function(target, property) {
-        if (property === 'locale') return wrappedLocale;
-        var value = Reflect.get(target, property, target);
-        return typeof value === 'function' ? value.bind(target) : value;
-      }
-    });
-  }
-
-  function bindVisionModeSettings(ctx) {
-    try {
-      var binder = ctx && ctx.settingsScope;
-      if (!binder || typeof binder.bind !== 'function') return undefined;
-      return binder.bind({ namespace: 'vision-router' });
-    } catch (_) {
-      return undefined;
-    }
   }
 
   // #138 Windows clipboard compatibility: desktop clipboards may expose an
@@ -948,54 +706,6 @@ export const CLIENT_PRESENTATION_PRELUDE = String.raw`(function(){
     }, 'vision-router: clipboard image paste normalization');
   }
 
-  // The composer chip chrome follows the shipped mode chips (ui-plan's PlanChip and the
-  // access-mode trigger): 28px tall, token radius, no border, token hover fill, the shipped
-  // focus ring, and the shipped "selected chip" treatment while Vision is on. The composer row
-  // is a size container (InputBar .row), so the label collapses to the 14px glyph below the
-  // shipped 460px cut — the same cut the access-mode trigger uses — instead of squeezing the
-  // model trigger on narrow windows.
-  var VISION_TOGGLE_CSS = '' +
-    '.vr-vision-toggle{display:inline-flex;align-items:center;gap:4px;min-width:0;height:28px;' +
-    'padding:0 8px;border:none;border-radius:var(--dsw-radius-sm);background:transparent;' +
-    'color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;font-weight:500;' +
-    'line-height:20px;cursor:pointer;white-space:nowrap}' +
-    '.vr-vision-toggle:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}' +
-    '.vr-vision-toggle:focus-visible{outline:var(--dsw-focus-ring-width) solid ' +
-    'var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:2px}' +
-    '.vr-vision-toggle:disabled{cursor:default}' +
-    // Dim only the states that read as "cannot be used right now". A disabled chip that is
-    // merely waiting for this toggle's own selection keeps full opacity, so the composer does
-    // not flash a greyed control while the model swap it owns is still settling.
-    '.vr-vision-toggle[data-dimmed="true"]{opacity:.45}' +
-    '.vr-vision-toggle[data-active="true"]{color:var(--dsw-alias-label-primary);' +
-    'background:var(--dsw-alias-button-ghost-active-fill);' +
-    'box-shadow:inset 0 0 0 1px var(--dsw-alias-button-ghost-active-border)}' +
-    '.vr-vision-toggle[data-active="true"]:hover:not(:disabled){' +
-    'background:var(--dsw-alias-button-ghost-active-hover)}' +
-    '.vr-vision-toggle-glyph{display:inline-flex;align-items:center;justify-content:center;' +
-    'flex:0 0 auto;width:14px;height:14px;font-size:13px;line-height:1;color:currentColor}' +
-    '.vr-vision-toggle-glyph-part{display:inline-flex;align-items:center;justify-content:center;' +
-    'width:14px;height:14px}' +
-    // The check carries the state only while the label is there to explain it. Once the label
-    // collapses (the shipped 460px cut below) a bare check means nothing, so the Vision eye —
-    // the only thing that still says what the chip does — stays, and the chip's selected chrome
-    // marks on/off on its own.
-    '.vr-vision-toggle-glyph-check{display:none}' +
-    '@container (min-width:460.01px){' +
-    '.vr-vision-toggle[data-active="true"] .vr-vision-toggle-glyph-eye{display:none}' +
-    '.vr-vision-toggle[data-active="true"] .vr-vision-toggle-glyph-check{display:inline-flex}}' +
-    '@container (max-width:460px){.vr-vision-toggle-label{display:none}}';
-
-  function installVisionToggleStyles() {
-    if (typeof document === 'undefined' || !document.head) return undefined;
-    var tag = document.createElement('style');
-    tag.dataset.plugin = 'dsh-vision-router';
-    tag.dataset.pluginCss = 'dsh-vision-router/mode-toggle';
-    tag.textContent = VISION_TOGGLE_CSS;
-    document.head.appendChild(tag);
-    return function(){ tag.remove(); };
-  }
-
   // A fresh presented image below the reader is the same as not being shown. Centre only that
   // card; visible cards and history on either side of a restored viewport stay untouched.
   function focusPresentedCard(node, viewportHeight) {
@@ -1041,351 +751,20 @@ export const CLIENT_PRESENTATION_PRELUDE = String.raw`(function(){
     };
   } catch (_) {}
 
-  function installVisionModeToggle(ctx, React, primitives) {
-    if (!ctx || typeof ctx.inject !== 'function' || !React) return;
-    var zh = {
-      label: '识图',
-      enable: '开启识图模式',
-      disable: '关闭识图模式',
-      unavailable: '当前模型没有对应的「+ 自动识图」版本',
-      loading: '正在读取模型信息…',
-      switching: '正在切换识图模式…',
-      failed: '模型操作失败：{message}',
-      failedUnknown: '未知错误'
-    };
-    var en = {
-      label: 'Vision',
-      enable: 'Enable Vision mode',
-      disable: 'Disable Vision mode',
-      unavailable: 'No matching “+ Auto Vision” model is available',
-      loading: 'Loading model information…',
-      switching: 'Switching Vision mode…',
-      failed: 'Model action failed: {message}',
-      failedUnknown: 'Unknown error'
-    };
-
-    try {
-      ctx.effect(function(){ return ctx.locale.register(VISION_MODE_NS, { zh: zh, en: en }); }, 'vision-router: mode toggle locale');
-    } catch (_) {}
-    try {
-      ctx.effect(function(){ return installVisionToggleStyles(); }, 'vision-router: mode toggle styles');
-    } catch (_) {}
-
-    function FallbackToast(props) {
-      React.useEffect(function(){
-        if (typeof setTimeout !== 'function') return undefined;
-        var timer = setTimeout(props.onDone, 4000);
-        return function(){ if (typeof clearTimeout === 'function') clearTimeout(timer); };
-      }, [props.text]);
-      return React.createElement('div', {
-        role: 'alert',
-        style: {
-          position: 'fixed',
-          top: 36,
-          left: '50%',
-          transform: 'translateX(-50%)',
-          zIndex: 12000,
-          maxWidth: 'min(760px, calc(100vw - 32px))',
-          boxSizing: 'border-box',
-          padding: '12px 16px',
-          borderRadius: 12,
-          border: '1px solid var(--dsw-alias-border-l2)',
-          background: 'var(--dsw-alias-bg-layer-2)',
-          color: 'var(--dsw-alias-label-primary)',
-          boxShadow: '0 12px 40px #0005',
-          fontSize: 13,
-          lineHeight: 1.5
-        }
-      }, '⚠ ', props.text);
-    }
-
-    var ToastComponent = primitives && typeof primitives.Toast === 'function' ? primitives.Toast : FallbackToast;
-    // The product icon set names weights, not sizes (IconWarningOutlineRegular); the old
-    // "…16" spelling never existed, so the toast silently fell back to a text glyph.
-    var WarningIcon = primitives && typeof primitives.IconWarningOutlineRegular === 'function'
-      ? primitives.IconWarningOutlineRegular
-      : primitives && typeof primitives.IconWarningOutline16 === 'function'
-        ? primitives.IconWarningOutline16
-        : undefined;
-
-    var settings = bindVisionModeSettings(ctx);
-    var unavailableSettingsState = { value: undefined };
-    ctx.inject(['slots', 'modelDirectories', 'sessions', 'remote'], function(scope) {
-      // Cold directoryFor calls use the caller's Cordis context, including its
-      // remote.session declaration. Probe only once modelDirectories is ready;
-      // older Hosts must not acquire a hard dependency on the alpha namespace.
-      var session;
-      try {
-        session = typeof scope.get === 'function' ? scope.get('remote.session') : undefined;
-      } catch (_) {}
-      if (session) scope.inject(['remote.session'], installToggle);
-      else installToggle(scope);
-    });
-
-    function installToggle(scope) {
-      var models;
-      try {
-        models = scope.modelDirectories || (typeof scope.get === 'function' ? scope.get('modelDirectories') : undefined);
-      } catch (_) {
-        models = undefined;
-      }
-      if (!models || typeof models.directoryFor !== 'function') return;
-
-      function fallbackTranslate(active) {
-        return function(key, params) {
-          var template = zh[key] || (active ? zh.disable : zh.enable);
-          if (!params) return template;
-          return template.replace(/\{(\w+)\}/g, function(match, name) {
-            return Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : match;
-          });
-        };
-      }
-
-      function VisionModeToggle(props) {
-        var directory = props.directory;
-        var store = directory && directory.store;
-        var fallbackState = { current: null, groups: [], status: 'idle', error: null };
-        var state = React.useSyncExternalStore(
-          store && typeof store.subscribe === 'function' ? function(listener){ return store.subscribe(listener); } : function(){ return function(){}; },
-          store && typeof store.getSnapshot === 'function' ? function(){ return store.getSnapshot(); } : function(){ return fallbackState; }
-        );
-        var settingsState = React.useSyncExternalStore(
-          settings && typeof settings.subscribe === 'function' ? function(listener){ return settings.subscribe(listener); } : function(){ return function(){}; },
-          settings && typeof settings.getSnapshot === 'function'
-            ? function(){ return settings.getSnapshot(); }
-            : function(){ return unavailableSettingsState; }
-        );
-        var visionConfig = settingsState && settingsState.value && typeof settingsState.value === 'object'
-          ? settingsState.value
-          : {};
-        // A Vision click may briefly drive this same Host directory through
-        // selecting -> idle/loading while its projection is recomputed. Smooth
-        // only that owned transaction: unrelated Host reloads (connection,
-        // adapters, settings, credentials) must keep their loading authority.
-        var usable = !!(state.current &&
-          typeof state.current.provider === 'string' && state.current.provider !== '') &&
-          Array.isArray(state.groups) && state.groups.length > 0;
-        var settling = state.status === 'idle' || state.status === 'loading';
-        var livePair = resolveVisionModePair(state.groups, state.current, visionConfig);
-        var complete = usable && livePair.mode !== 'unavailable';
-        var settledMode = React.useRef(null);
-        var toggleTransition = React.useRef(null);
-        // The Host may render a ready directory while the RPC that selected
-        // it is still in flight. Keep only an in-flight transaction fence here,
-        // never a second source of truth for Vision ON/OFF.
-        var selectionTransaction = React.useRef(null);
-        var refreshSelection = React.useState(0)[1];
-        var selectionInFlight = !!(selectionTransaction.current &&
-          selectionTransaction.current.directory === directory);
-        if (settledMode.current && settledMode.current.directory !== directory) settledMode.current = null;
-        if (toggleTransition.current && toggleTransition.current.directory !== directory) toggleTransition.current = null;
-        if (complete) settledMode.current = { directory: directory, mode: livePair.mode };
-        var transition = toggleTransition.current;
-        if (transition && state.status === 'selecting') {
-          var pending = state.pending;
-          var matchesPending = !!(pending &&
-            pending.provider === transition.target.provider &&
-            pending.model === transition.target.model &&
-            pending.reasoningEffort === transition.target.reasoningEffort);
-          if (matchesPending) transition.seenSelecting = true;
-          else toggleTransition.current = null;
-        }
-        transition = toggleTransition.current;
-        var ownSettling = !!(transition && transition.seenSelecting && settling && settledMode.current);
-        if (!ownSettling && transition && state.status !== 'selecting' &&
-          (state.status === 'error' || state.status === 'ready')) {
-          toggleTransition.current = null;
-        }
-        var pair = ownSettling ? { mode: settledMode.current.mode } : livePair;
-        var active = pair.mode === 'on';
-        var toastState = React.useState(null);
-        var toast = toastState[0];
-        var setToast = toastState[1];
-        var busy = state.status === 'selecting' || selectionInFlight;
-        var loading = settling;
-        // Host's model-catalog refresh retains the last good current/groups,
-        // but briefly reports 'loading'. When that *complete* pair is still
-        // present, its selection may be sent to Host for fresh validation;
-        // don't flip the native HTML disabled bit in the middle of a user's
-        // pointer gesture (Chromium drops the click even after re-enabling).
-        // A cold load, reconnect, unavailable pair, or selection in flight
-        // remains blocked. We never infer a new mode or optimistically commit.
-        var refreshWithPair = state.status === 'loading' && complete &&
-          !!livePair.target && state.pending == null && state.error == null &&
-          state.routable !== false;
-        var blockingLoad = loading && !refreshWithPair;
-        var removed = props.session && props.session.removed === true;
-        var disabled = props.available !== true || removed || busy || blockingLoad || livePair.mode === 'unavailable';
-        var t = typeof props.t === 'function' ? props.t : fallbackTranslate(active);
-        var title = busy || ownSettling
-          ? t('switching')
-          : blockingLoad
-            ? t('loading')
-            : livePair.mode === 'unavailable'
-              ? t('unavailable')
-              : active ? t('disable') : t('enable');
-        function announceRejectedSelection() {
-          var latest;
-          try {
-            latest = store && typeof store.getSnapshot === 'function' ? store.getSnapshot() : undefined;
-          } catch (_) {
-            latest = undefined;
-          }
-          var message = latest && typeof latest.error === 'string' && latest.error !== ''
-            ? latest.error
-            : t('failedUnknown');
-          setToast(function(previous){
-            return {
-              seq: previous && Number.isFinite(previous.seq) ? previous.seq + 1 : 1,
-              text: t('failed', { message: message })
-            };
-          });
-        }
-
-        var button = React.createElement('button', {
-          type: 'button',
-          'data-vision-router-mode-toggle': 'true',
-          'aria-pressed': active,
-          'aria-label': title,
-          'aria-busy': busy || blockingLoad,
-          title: title,
-          disabled: disabled,
-          className: 'vr-vision-toggle',
-          'data-active': active ? 'true' : 'false',
-          'data-dimmed': disabled && !ownSettling && (livePair.mode === 'unavailable' || blockingLoad) ? 'true' : 'false',
-          onClick: function() {
-            if (disabled || !pair.target || typeof props.select !== 'function' ||
-              (selectionTransaction.current && selectionTransaction.current.directory === directory)) return;
-            var target = pair.target;
-            var ticket = { directory: directory, target: target };
-            selectionTransaction.current = ticket;
-            refreshSelection(function(revision){ return revision + 1; });
-            toggleTransition.current = {
-              directory: directory,
-              target: target,
-              seenSelecting: false
-            };
-            setToast(null);
-            var pending;
-            try { pending = props.select(target); }
-            catch (error) { pending = Promise.reject(error); }
-            void Promise.resolve(pending).then(function(accepted){
-              if (selectionTransaction.current !== ticket) return;
-              if (!accepted) {
-                toggleTransition.current = null;
-                announceRejectedSelection();
-                return;
-              }
-              var latest;
-              try { latest = store && typeof store.getSnapshot === 'function' ? store.getSnapshot() : undefined; } catch (_) {}
-              if (!latest || (latest.status !== 'selecting' && latest.status !== 'idle' && latest.status !== 'loading')) {
-                toggleTransition.current = null;
-              }
-            }, function(error){
-              if (selectionTransaction.current !== ticket) return;
-              toggleTransition.current = null;
-              announceRejectedSelection();
-            }).finally(function(){
-              if (selectionTransaction.current !== ticket) return;
-              selectionTransaction.current = null;
-              refreshSelection(function(revision){ return revision + 1; });
-            });
-          }
-        },
-          // One fixed 14px leading slot carries both glyphs: the Vision eye and the check that
-          // marks the enabled state. The stylesheet shows the check only while the label is
-          // present (the same 460px container cut that collapses the label), because a bare check
-          // tells a reader nothing — once the label is gone the eye, which still says what the
-          // chip does, stays. The slot is a fixed 14px box either way, so the chip width never
-          // changes with the state.
-          React.createElement('span', {
-            'aria-hidden': 'true',
-            className: 'vr-vision-toggle-glyph'
-          },
-          React.createElement('span', { className: 'vr-vision-toggle-glyph-part vr-vision-toggle-glyph-eye' }, '👁'),
-          React.createElement('span', { className: 'vr-vision-toggle-glyph-part vr-vision-toggle-glyph-check' }, '✓')),
-          React.createElement('span', { className: 'vr-vision-toggle-label' }, t('label'))
-        );
-
-        var toastNode = toast
-          ? React.createElement(ToastComponent, {
-              key: toast.seq,
-              text: toast.text,
-              icon: WarningIcon
-                ? React.createElement(WarningIcon)
-                : React.createElement('span', { 'aria-hidden': 'true' }, '⚠'),
-              anchor: typeof document !== 'undefined'
-                ? document.querySelector('[data-composer-card]')
-                : null,
-              onDone: function(){ setToast(null); }
-            })
-          : null;
-        return React.createElement(React.Fragment, null, button, toastNode);
-      }
-
-      scope.effect(function() {
-        return scope.slots.inject('conversation.input.right', function*() {
-          yield scope.slots.register({
-            name: 'conversation.input.right',
-            id: 'vision-router-mode-toggle',
-            order: 40,
-            locale: VISION_MODE_NS,
-            inject: function(sessionId) {
-              var directory = models.directoryFor(sessionId);
-              var available = true;
-              try {
-                available = !scope.sessions || typeof scope.sessions.subagentAddress !== 'function'
-                  ? true
-                  : scope.sessions.subagentAddress(sessionId) === undefined;
-              } catch (_) {
-                available = false;
-              }
-              return {
-                directory: directory,
-                available: available,
-                select: function(selection) {
-                  if (!available || !directory || typeof directory.select !== 'function') {
-                    return Promise.resolve(false);
-                  }
-                  try {
-                    return Promise.resolve(directory.select(selection)).then(
-                      function(result){ return !result || result.ok !== false; },
-                      function(){ return false; }
-                    );
-                  } catch (_) {
-                    return Promise.resolve(false);
-                  }
-                }
-              };
-            }
-          }, VisionModeToggle);
-        });
-      }, 'vision-router: composer vision mode toggle');
-    }
-  }
-
-  function decorateVisionRouterPlugin(plugin, React, primitives) {
+  function decorateVisionRouterPlugin(plugin) {
     if (!plugin || typeof plugin !== 'object' || typeof plugin.apply !== 'function') return plugin;
-    if (plugin.apply.__visionRouterModeToggle) return plugin;
+    if (plugin.apply.__visionRouterPasteCompat) return plugin;
     var originalApply = plugin.apply;
     function apply(ctx) {
-      var decoratedCtx = contextWithVisionModeCopy(ctx);
-      var args = Array.prototype.slice.call(arguments);
-      args[0] = decoratedCtx;
-      var result = originalApply.apply(this, args);
+      var result = originalApply.apply(this, arguments);
       try {
-        installClipboardImagePasteCompat(decoratedCtx);
+        installClipboardImagePasteCompat(ctx);
       } catch (error) {
         try { console.warn('vision-router: failed to install clipboard image paste compatibility', error); } catch (_) {}
       }
-      try {
-        installVisionModeToggle(decoratedCtx, React, primitives);
-      } catch (error) {
-        try { console.warn('vision-router: failed to install composer vision mode toggle', error); } catch (_) {}
-      }
       return result;
     }
-    try { Object.defineProperty(apply, '__visionRouterModeToggle', { value: true }); } catch (_) {}
+    try { Object.defineProperty(apply, '__visionRouterPasteCompat', { value: true }); } catch (_) {}
     plugin.apply = apply;
     return plugin;
   }
@@ -1401,18 +780,12 @@ export const CLIENT_PRESENTATION_PRELUDE = String.raw`(function(){
           spec = Object.assign({}, spec, {
             factory: function(require) {
               var React = require('react');
-              var primitives;
-              try {
-                primitives = require('@deepseek-ai/dsh-client-ui-primitives');
-              } catch (_) {
-                primitives = undefined;
-              }
               var presentation = createPresentation(React);
               function scopedRequire(id) {
                 if (id === LEGACY_ATTACHMENT_VALUE) return presentation;
                 return require(id);
               }
-              return decorateVisionRouterPlugin(factory(scopedRequire), React, primitives);
+              return decorateVisionRouterPlugin(factory(scopedRequire));
             }
           });
         }

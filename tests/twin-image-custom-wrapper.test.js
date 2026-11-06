@@ -8,6 +8,7 @@ import {
   isImageInputUnsupportedFailure,
   twinRequestHasImage,
 } from '../lib/twin-image-capability-fallback.js'
+import { Config } from '../index.js'
 
 function sourceAdapter() {
   return {
@@ -246,5 +247,35 @@ test('specific nested capability code wins even under a generic outer error code
       error: { code: 'UNSUPPORTED_IMAGE_INPUT' },
     }),
     true,
+  )
+})
+
+// ── P5 migration semantics (plan §4.5): wrapperRoute/chainRoute are
+// migration-only schema fields now, but the names a persisted profile carries
+// must still keep those historical product routes OUT of generated-twin
+// ownership — exactly as they did while the routes were live.
+
+test('P5: Config-migrated wrapper/chain route names stay excluded from generated-twin ownership', () => {
+  const migrated = Config({ wrapperRoute: 'legacy-vision', chainRoute: 'legacy-chain' })
+  const { ctx, registrations } = registrationHarness(migrated)
+  const wrapped = contextWithTwinImageCapabilityFallback(ctx)
+  const identityAdapter = {
+    async *stream() {
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+
+  wrapped.llm.registerAdapter(['legacy-vision'], identityAdapter)
+  wrapped.llm.registerAdapter(['legacy-chain'], identityAdapter)
+
+  assert.equal(
+    registrations.get('legacy-vision').adapter,
+    identityAdapter,
+    'the migrated wrapperRoute name stays a distinct product route, never a wrapped twin',
+  )
+  assert.equal(
+    registrations.get('legacy-chain').adapter,
+    identityAdapter,
+    'the migrated chainRoute name stays a distinct product route, never a wrapped twin',
   )
 })

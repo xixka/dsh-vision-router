@@ -188,39 +188,28 @@ test('bitmap resource transform fails closed when the legacy anchor drifts', () 
   )
 })
 
-test('the composer vision chip follows the shipped chip chrome and collapses on narrow rows', () => {
+test('the retired composer vision chip is absent and the generic image surfaces remain', () => {
   const prelude = CLIENT_PRESENTATION_PRELUDE
-  // Chrome comes from the shipped chip language (ui-plan PlanChip / the access-mode trigger):
-  // token radius, no hand-rolled border or brand fill, token hover and focus ring.
-  assert.match(prelude, /\.vr-vision-toggle\{[^}]*height:28px/)
-  assert.match(prelude, /\.vr-vision-toggle\{[^}]*border:none/)
-  assert.match(prelude, /\.vr-vision-toggle\{[^}]*border-radius:var\(--dsw-radius-sm\)/)
-  assert.match(prelude, /\.vr-vision-toggle\{[^}]*font-size:13px/)
-  assert.match(prelude, /\.vr-vision-toggle:hover:not\(:disabled\)\{background:var\(--dsw-alias-interactive-bg-hover\)\}/)
-  assert.match(prelude, /\.vr-vision-toggle:focus-visible\{outline:var\(--dsw-focus-ring-width\)/)
-  assert.match(prelude, /\.vr-vision-toggle\[data-active="true"\]\{[^}]*--dsw-alias-button-ghost-active-fill/)
-  // Only the unavailable/loading states dim the chip; waiting on this toggle's own
-  // selection must not grey it out.
-  assert.match(prelude, /\.vr-vision-toggle\[data-dimmed="true"\]\{opacity:\.45\}/)
-  assert.ok(!/\.vr-vision-toggle:disabled\{opacity/.test(prelude), 'the chip must not dim on every disabled state')
-  assert.ok(!prelude.includes("border: '1px solid '"), 'the chip must not carry a hand-rolled border')
-  // The composer row is a size container, so the label collapses to the 14px glyph below the
-  // same 460px cut the shipped access-mode trigger uses.
-  assert.match(prelude, /@container \(max-width:460px\)\{\.vr-vision-toggle-label\{display:none\}\}/)
-  assert.match(prelude, /\.vr-vision-toggle-glyph\{[^}]*width:14px/)
-  assert.ok(prelude.includes("className: 'vr-vision-toggle-label'"), 'the label carries the collapsing class')
-  assert.ok(prelude.includes("className: 'vr-vision-toggle-glyph'"), 'the glyph slot carries its own class')
-  // The check marks the state only while the label is there to explain it; once the label
-  // collapses, the Vision eye stays so an icon-only chip still says what it does. The rule is
-  // assembled from concatenated fragments at runtime, so assert the fragments.
-  assert.ok(prelude.includes("'.vr-vision-toggle-glyph-check{display:none}'"))
-  assert.ok(prelude.includes("'@container (min-width:460.01px){'"))
-  assert.ok(prelude.includes("'.vr-vision-toggle[data-active=\"true\"] .vr-vision-toggle-glyph-eye{display:none}'"))
-  assert.ok(prelude.includes("'.vr-vision-toggle[data-active=\"true\"] .vr-vision-toggle-glyph-check{display:inline-flex}}'"))
-  assert.ok(prelude.includes('vr-vision-toggle-glyph-part vr-vision-toggle-glyph-eye'))
-  assert.ok(prelude.includes('vr-vision-toggle-glyph-part vr-vision-toggle-glyph-check'))
-  // The plugin stylesheet is installed with the toggle and torn down with its effect.
-  assert.ok(prelude.includes("tag.dataset.pluginCss = 'dsh-vision-router/mode-toggle'"))
+  // #284's composer Vision chip is retired (plan §5.2): no chip chrome, no
+  // toggle stylesheet, no slot registration, no toggle locale namespace.
+  for (const stale of [
+    'vr-vision-toggle',
+    'vision-router-mode-toggle',
+    'conversation.input.right',
+    '@container (max-width:460px)',
+    '@container (min-width:460.01px)',
+    "tag.dataset.pluginCss = 'dsh-vision-router/mode-toggle'",
+    "require('@deepseek-ai/dsh-client-ui-primitives')",
+    'data-active',
+    'aria-pressed',
+  ]) {
+    assert.equal(prelude.includes(stale), false, `the retired chip surface must not contain ${stale}`)
+  }
+  // The generic image preview and paste compatibility stay first-class.
+  assert.match(prelude, /function PresentedImage\(props\)/)
+  assert.match(prelude, /function ImageGallery\(props\)/)
+  assert.match(prelude, /__dvrPresentFocus/)
+  assert.match(prelude, /installClipboardImagePasteCompat/)
 })
 
 test('manifest does not declare DSH ui-attachment as a client value dependency', async () => {

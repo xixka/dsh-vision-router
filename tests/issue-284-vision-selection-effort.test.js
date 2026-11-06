@@ -1,151 +1,67 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mapVisionPresentationSelection } from '../lib/vision-model-visibility-boundary.js'
-import {
-  CLIENT_PRESENTATION_PRELUDE,
-  resolveVisionModePair,
-} from '../lib/client-presentation-boundary.js'
+import { readFileSync } from 'node:fs'
 
-function group(id, name, models) {
-  return {
-    id,
-    name,
-    models: models.map((model) => ({ id: model, name: model })),
+import { CLIENT_PRESENTATION_PRELUDE } from '../lib/client-presentation-boundary.js'
+
+const clientSource = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+
+/**
+ * #284/#431 effort semantics after the P5 UI retirement. The old world kept an
+ * invisible wrapper route active while Vision was on and remapped same-provider
+ * /model selections onto it (preserving effort, hiding the wrapper). With the
+ * composer toggle and the /model filter retired there is no hidden wrapper to
+ * preserve: a user's /model selection is submitted exactly as chosen, and
+ * reasoning effort travels with the ordinary Host selection. These tests pin
+ * that no selection remapping code remains and that the guide copy stopped
+ * explaining wrapper-preservation semantics.
+ */
+test('issue #284 retirement: no presentation-layer selection remapping exists', () => {
+  for (const stale of [
+    'mapVisionPresentationSelection',
+    'projectVisionModeDirectoryState',
+    'wrappedProviders',
+    'autoWrapProviders',
+    'wrapperRoute',
+    'reasoningEffort',
+  ]) {
+    assert.equal(CLIENT_PRESENTATION_PRELUDE.includes(stale), false, `prelude must not contain ${stale}`)
   }
-}
+  const wrapperSource = readFileSync(new URL('../lib/client-presentation-boundary.js', import.meta.url), 'utf8')
+  assert.equal(wrapperSource.includes('mapVisionPresentationSelection'), false)
+})
 
-const groups = [
-  group('alpha', 'Alpha', ['alpha-1', 'alpha-2']),
-  group('alpha-vision', 'Alpha + 自动识图', ['alpha-1', 'alpha-2']),
-  group('beta', 'Beta', ['shared-model']),
-  group('beta-vision', 'Beta + 自动识图', ['shared-model']),
-  group('gamma', 'Gamma', ['shared-model']),
-  group('gamma-vision', 'Gamma + 自动识图', ['shared-model']),
-]
-
-const config = {
-  autoWrapProviders: true,
-  wrapperRoute: 'deepseek-vision',
-}
-
-function activeState() {
-  return {
-    current: {
-      provider: 'alpha-vision',
-      model: 'alpha-1',
-      reasoningEffort: 'high',
-    },
-    groups,
+test('issue #431 guide copy no longer explains wrapper-preservation semantics', () => {
+  // The retired copy described switching models within a model group keeping
+  // the hidden wrapper route (and therefore Vision mode) active.
+  for (const stale of [
+    '同一模型组内切换到另一个支持识图模式的模型也会保持开启',
+    'switch to another Vision-enabled model in the same model group',
+    '没有对应识图模式的普通模型',
+    'normal model with no matching Vision route',
+  ]) {
+    assert.equal(CLIENT_PRESENTATION_PRELUDE.includes(stale), false, `prelude must not contain ${stale}`)
+    assert.equal(clientSource.includes(stale), false, `client bundle must not contain ${stale}`)
   }
-}
-
-test('issue #284 choosing another provider while Vision is on leaves the wrapper instead of inheriting the previous effort', () => {
-  const mapped = mapVisionPresentationSelection(
-    activeState(),
-    { provider: 'beta', model: 'shared-model' },
-    config,
-  )
-
-  assert.deepEqual(mapped, {
-    provider: 'beta',
-    model: 'shared-model',
-  })
-  assert.equal(Object.prototype.hasOwnProperty.call(mapped, 'reasoningEffort'), false)
 })
 
-test('issue #431 choosing another model in the same wrapped provider keeps Vision and Provider Default semantics', () => {
-  const mapped = mapVisionPresentationSelection(
-    activeState(),
-    { provider: 'alpha', model: 'alpha-2' },
-    config,
-  )
-
-  assert.deepEqual(mapped, {
-    provider: 'alpha-vision',
-    model: 'alpha-2',
-  })
-  assert.equal(Object.prototype.hasOwnProperty.call(mapped, 'reasoningEffort'), false)
+test('issue #284 retirement: the walkthrough now teaches the /vision command for image turns', () => {
+  assert.match(clientSource, /\/vision on 开启识图/)
+  assert.match(clientSource, /\/vision <问题> 并附上图片/)
+  assert.match(clientSource, /run \/vision on/)
+  assert.match(clientSource, /send \/vision <question> with the image attached/)
 })
 
-test('issue #284 an explicitly selected effort on a different model is preserved while leaving Vision', () => {
-  const mapped = mapVisionPresentationSelection(
-    activeState(),
-    { provider: 'beta', model: 'shared-model', reasoningEffort: 'low' },
-    config,
-  )
-
-  assert.deepEqual(mapped, {
-    provider: 'beta',
-    model: 'shared-model',
-    reasoningEffort: 'low',
-  })
-})
-
-test('issue #284 exact source provider plus model identity wins when model ids collide', () => {
-  const mapped = mapVisionPresentationSelection(
-    activeState(),
-    { provider: 'gamma', model: 'shared-model' },
-    config,
-  )
-
-  assert.equal(mapped.provider, 'gamma')
-  assert.equal(mapped.model, 'shared-model')
-})
-
-test('issue #284 effort-only edits on the projected current model stay on the hidden wrapper', () => {
-  const mapped = mapVisionPresentationSelection(
-    activeState(),
-    { provider: 'alpha', model: 'alpha-1', reasoningEffort: 'low' },
-    config,
-  )
-
-  assert.deepEqual(mapped, {
-    provider: 'alpha-vision',
-    model: 'alpha-1',
-    reasoningEffort: 'low',
-  })
-})
-
-test('issue #284 selecting an already verified wrapper is idempotent', () => {
-  const incoming = {
-    provider: 'beta-vision',
-    model: 'shared-model',
-    reasoningEffort: 'low',
+test('issue #284 retirement: no "-vision" twin or lookalike inference ships anywhere in the boundary', () => {
+  const mainSource = readFileSync(new URL('../lib/client-presentation-boundary-main.js', import.meta.url), 'utf8')
+  for (const stale of [
+    "endsWith('-vision')",
+    "'-vision'.length",
+    '-vision-vision',
+    '自动识图',
+    'studio-vision',
+  ]) {
+    assert.equal(mainSource.includes(stale), false, `boundary source must not contain ${stale}`)
+    assert.equal(CLIENT_PRESENTATION_PRELUDE.includes(stale), false, `prelude must not contain ${stale}`)
   }
-  const mapped = mapVisionPresentationSelection(activeState(), incoming, config)
-
-  assert.deepEqual(mapped, incoming)
-})
-
-test('issue #284 an ordinary provider ending in -vision never manufactures a nested twin', () => {
-  const suffixGroups = [
-    group('studio-vision', 'Studio Vision', ['m']),
-    group('studio-vision-vision', 'Studio Vision + 自动识图', ['m']),
-  ]
-
-  assert.deepEqual(resolveVisionModePair(
-    suffixGroups,
-    { provider: 'studio-vision', model: 'm', reasoningEffort: 'low' },
-    { autoWrapProviders: true },
-  ), { mode: 'unavailable' })
-})
-
-test('issue #284 a nested -vision-vision lookalike is never treated as a Vision Router-owned twin', () => {
-  const suffixGroups = [
-    group('studio-vision', 'Studio Vision', ['m']),
-    group('studio-vision-vision', 'Studio Vision + 自动识图', ['m']),
-  ]
-
-  assert.deepEqual(resolveVisionModePair(
-    suffixGroups,
-    { provider: 'studio-vision-vision', model: 'm' },
-    { autoWrapProviders: true },
-  ), { mode: 'unavailable' })
-})
-
-test('issue #431 guide copy explains when model changes preserve or leave Vision mode', () => {
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes('同一模型组内切换到另一个支持识图模式的模型也会保持开启'), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes('switch to another Vision-enabled model in the same model group'), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes('没有对应识图模式的普通模型'), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes('normal model with no matching Vision route'), true)
 })

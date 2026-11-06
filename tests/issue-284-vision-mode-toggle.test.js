@@ -2,115 +2,24 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
-import { installDesktopVisionToggleAudit, installDesktopModelSelectionTrace } from '../scripts/dsh-desktop-toggle-stability.mjs'
+
 import {
   CLIENT_PRESENTATION_PRELUDE,
-  resolveVisionModePair,
+  injectClientPresentationBoundary,
 } from '../lib/client-presentation-boundary.js'
 
-const groups = [
-  {
-    id: 'opencode-go',
-    name: 'OpenCode Go',
-    models: [
-      { id: 'qwen3.6-plus', name: 'Qwen 3.6 Plus' },
-      { id: 'minimax-m2.7', name: 'MiniMax M2.7' },
-    ],
-  },
-  {
-    id: 'opencode-go-vision',
-    name: 'OpenCode Go + 自动识图',
-    models: [
-      { id: 'qwen3.6-plus', name: 'Qwen 3.6 Plus' },
-      { id: 'minimax-m2.7', name: 'MiniMax M2.7' },
-    ],
-  },
-]
+const mainSource = readFileSync(new URL('../lib/client-presentation-boundary-main.js', import.meta.url), 'utf8')
 
-const deepseekGroups = (wrapperRoute = 'deepseek-vision') => [
-  {
-    id: 'deepseek-official',
-    name: 'DeepSeek',
-    models: [
-      { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-      { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-    ],
-  },
-  {
-    id: wrapperRoute,
-    name: 'DeepSeek + 自动识图',
-    models: [
-      { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-      { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-    ],
-  },
-]
-
-function translate(key, params) {
-  const copy = {
-    label: '识图',
-    enable: '开启识图模式',
-    disable: '关闭识图模式',
-    unavailable: '不可用',
-    loading: '加载中',
-    switching: '切换中',
-    failed: '模型操作失败：{message}',
-    failedUnknown: '未知错误',
-  }
-  const template = copy[key] ?? key
-  if (!params) return template
-  return template.replace(/\{(\w+)\}/g, (match, name) =>
-    Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : match)
-}
-
-function createHookReact() {
-  const states = []
-  const refs = []
-  let cursor = 0
-  return {
-    Fragment: Symbol('Fragment'),
-    begin() { cursor = 0 },
-    createElement(type, props, ...children) { return { type, props: props ?? {}, children } },
-    useState(initial) {
-      const at = cursor++
-      if (!(at in states)) states[at] = initial
-      return [states[at], (next) => {
-        states[at] = typeof next === 'function' ? next(states[at]) : next
-      }]
-    },
-    useRef(initial) {
-      const at = cursor++
-      if (!(at in refs)) refs[at] = { current: initial }
-      return refs[at]
-    },
-    useEffect() {},
-    useSyncExternalStore(_subscribe, getSnapshot) { return getSnapshot() },
-  }
-}
-
-function firstChildOfType(node, type) {
-  if (!node) return undefined
-  if (node.type === type) return node
-  if (!Array.isArray(node.children)) return undefined
-  return node.children.find((child) => child && child.type === type)
-}
-
-function buttonOf(rendered) {
-  return firstChildOfType(rendered, 'button')
-}
-
-function createBrowserHarness({
-  modelGroups = groups,
-  current = { provider: 'opencode-go', model: 'qwen3.6-plus', reasoningEffort: 'high' },
-  wrapperRoute = 'deepseek-vision',
-  rejectSelection = false,
-  returnSelectionFailure = false,
-  returnSelectionFailureAt = null,
-  staleProjectionAt = null,
-  deferSelection = false,
-  deferSelectionAt = null,
-  deferCompletion = false,
-} = {}) {
+/**
+ * #284 after the P5 UI retirement: the composer Vision mode toggle is gone.
+ * Vision mode is controlled exclusively by the /vision command. These tests
+ * pin the no-button contract of the presentation boundary instead of the
+ * removed toggle behavior: no composer slot registration, no toggle locale,
+ * no chip stylesheet, and — critically — the generic image surfaces
+ * (ImageGallery value, presented-card focus, clipboard paste compatibility)
+ * must survive the retirement unchanged.
+ */
+function createBoundaryHarness({ pluginApply } = {}) {
   let registered
   const loader = {
     load(spec) {
@@ -133,115 +42,34 @@ function createBrowserHarness({
     console,
   })
 
-  const selections = []
-  let releaseSelection
-  let releaseInjectedSelection
-  let releaseCompletion
-  const selectionGate = deferSelection
-    ? new Promise((resolve) => { releaseSelection = resolve })
-    : undefined
-  const completionGate = deferCompletion
-    ? new Promise((resolve) => { releaseCompletion = resolve })
-    : undefined
-  let snapshot = {
-    current,
-    groups: modelGroups,
-    status: 'ready',
-    error: null,
+  const React = {
+    Fragment: Symbol('Fragment'),
+    createElement() {},
+    useState() { return [null, () => {}] },
+    useEffect() {},
   }
-  let settingsSnapshot = {
-    status: 'ready',
-    value: { wrapperRoute },
-  }
-  const store = {
-    subscribe() { return () => {} },
-    getSnapshot() { return snapshot },
-  }
-  const directory = {
-    store,
-    async select(selection) {
-      selections.push(selection)
-      if (rejectSelection || returnSelectionFailure || selections.length === returnSelectionFailureAt) {
-        const failure = rejectSelection || returnSelectionFailure
-          || 'session/writer-held: Another writer temporarily owns this session.'
-        const message = typeof failure === 'string'
-          ? failure
-          : 'model-unavailable: Model "qwen3.6-plus" does not accept image input, but this session already contains images; select an image-capable model.'
-        snapshot = { ...snapshot, status: 'error', error: message }
-        if (rejectSelection) throw new Error(`session.selectModel failed: ${message}`)
-        const separator = message.indexOf(': ')
-        return {
-          ok: false,
-          error: {
-            code: separator === -1 ? 'model-unavailable' : message.slice(0, separator),
-            message: separator === -1 ? message : message.slice(separator + 2),
-          },
-        }
-      }
-      if (selectionGate || selections.length === deferSelectionAt) {
-        snapshot = { ...snapshot, status: 'selecting', pending: selection, error: null }
-        if (selectionGate) await selectionGate
-        else await new Promise((resolve) => { releaseInjectedSelection = resolve })
-      }
-      // A successful Host RPC may settle before its projected model selection
-      // reaches the client. The visible mode must not anticipate the projection.
-      if (selections.length === staleProjectionAt) {
-        snapshot = { ...snapshot, status: 'ready', pending: null, error: null }
-        return { ok: true, value: undefined }
-      }
-      snapshot = { ...snapshot, current: selection, status: 'ready', pending: null, error: null }
-      // Reproduce Desktop's real race: the directory advertises ready
-      // before the selection request's promise has resolved.
-      if (completionGate) await completionGate
-      return { ok: true, value: undefined }
-    },
-  }
-
-  const React = createHookReact()
-  function NativeToast() {}
-  function WarningIcon() {}
-  const primitives = { Toast: NativeToast, IconWarningOutline16: WarningIcon }
-
   loader.load({
     id: 'dsh-vision-router',
     factory(require) {
       require('@deepseek-ai/dsh-client-ui-attachment')
       return {
         apply(ctx) {
-          ctx.locale.register('vision-router', {
-            zh: {
-              quickStartTitle: '旧标题',
-              quickStartBody: '旧快速开始',
-              onboardingStep1Title: '旧步骤标题',
-              onboardingStep1Body: '旧引导',
-              guideStep1Title: '旧高亮标题',
-              guideStep1Body: '旧步骤',
-            },
-            en: {
-              quickStartTitle: 'old title',
-              quickStartBody: 'old quick start',
-              onboardingStep1Title: 'old step title',
-              onboardingStep1Body: 'old onboarding',
-              guideStep1Title: 'old guide title',
-              guideStep1Body: 'old guide',
-            },
-          })
+          if (pluginApply) pluginApply(ctx)
         },
       }
     },
   })
+
+  const requested = []
   const plugin = registered.factory((id) => {
+    requested.push(id)
     if (id === 'react') return React
-    if (id === '@deepseek-ai/dsh-client-ui-primitives') return primitives
     throw new Error(`unexpected host value request: ${id}`)
   })
 
-  let dependencyInjection
+  const effects = []
+  const injections = []
   const localeRegistrations = []
-  const settingsScope = {
-    subscribe() { return () => {} },
-    getSnapshot() { return settingsSnapshot },
-  }
   const ctx = {
     locale: {
       register(namespace, dictionaries) {
@@ -249,917 +77,97 @@ function createBrowserHarness({
         return () => {}
       },
     },
-    settingsScope: {
-      bind(spec) {
-        assert.equal(spec.namespace, 'vision-router')
-        return settingsScope
-      },
+    effect(run, label) {
+      effects.push(label)
+      return run()
     },
-    effect(run) { return run() },
-    inject(dependencies, callback) { dependencyInjection = { dependencies, callback } },
+    inject(dependencies, callback) {
+      injections.push(Array.from(dependencies))
+      callback({})
+    },
   }
+  return { plugin, ctx, effects, injections, localeRegistrations, requested }
+}
+
+test('issue #284 retirement: the presentation boundary carries no composer toggle surface', () => {
+  for (const stale of [
+    'vision-router-mode-toggle',
+    'conversation.input.right',
+    'vr-vision-toggle',
+    'dsh-vision-router/mode-toggle',
+    'resolveVisionModePair',
+    'settingsScope',
+    'Auto Vision',
+    '自动识图',
+  ]) {
+    assert.equal(CLIENT_PRESENTATION_PRELUDE.includes(stale), false, `prelude must not contain ${stale}`)
+    assert.equal(mainSource.includes(stale), false, `source must not contain ${stale}`)
+  }
+  // The toggle icon seam was a transform in client-presentation-boundary.js.
+  const wrapperSource = readFileSync(new URL('../lib/client-presentation-boundary.js', import.meta.url), 'utf8')
+  assert.equal(wrapperSource.includes('transformVisionModeToggleIcons'), false)
+  assert.equal(wrapperSource.includes('vr-vision-toggle'), false)
+})
+
+test('issue #284 retirement: the decorated client plugin registers no composer slot and no toggle locale', () => {
+  const { plugin, ctx, effects, injections, localeRegistrations, requested } = createBoundaryHarness()
   plugin.apply(ctx)
 
-  let slotName
-  let registration
-  let Component
-  const scope = {
-    modelDirectories: { directoryFor() { return directory } },
-    sessions: { subagentAddress() { return undefined } },
-    effect(run) { return run() },
-    slots: {
-      inject(name, entries) {
-        slotName = name
-        Array.from(entries())
-        return () => {}
-      },
-      register(options, component) {
-        registration = options
-        Component = component
-        return () => {}
-      },
-    },
+  assert.deepEqual(injections, [], 'no slots/modelDirectories/sessions/remote dependency may be injected')
+  assert.deepEqual(localeRegistrations, [], 'the retired vision-router-mode locale must not be registered')
+  assert.ok(
+    effects.some((label) => label === 'vision-router: clipboard image paste normalization'),
+    'the generic clipboard image paste compatibility must keep installing',
+  )
+  assert.ok(requested.includes('react'), 'the legacy factory still receives its React value')
+  assert.equal(
+    requested.includes('@deepseek-ai/dsh-client-ui-primitives'),
+    false,
+    'the toggle toast primitives dependency must be gone',
+  )
+  assert.equal(plugin.apply.__visionRouterPasteCompat, true, 'decoration stays idempotent across Host reloads')
+})
+
+test('issue #284 retirement: client locale dictionaries pass through unmodified', () => {
+  const dictionaries = {
+    zh: { quickStartBody: '本页文案', onboardingStep1Body: '步骤文案', guideStep1Body: '引导文案' },
+    en: { quickStartBody: 'copy', onboardingStep1Body: 'copy', guideStep1Body: 'copy' },
   }
-  dependencyInjection.callback(scope)
-  const props = registration.inject('session-1')
-
-  return {
-    React,
-    primitives,
-    dependencyInjection,
-    selections,
-    store,
-    directory,
-    props,
-    Component,
-    registration,
-    slotName,
-    localeRegistrations,
-    setSnapshot(next) { snapshot = next },
-    getSnapshot() { return snapshot },
-    resolveSelection() {
-      if (releaseSelection) releaseSelection()
-      if (releaseInjectedSelection) releaseInjectedSelection()
-    },
-    resolveCompletion() { if (releaseCompletion) releaseCompletion() },
-    setSettings(next) { settingsSnapshot = next },
-    render(extra = {}) {
-      React.begin()
-      return Component({ ...props, session: {}, t: translate, ...extra })
-    },
-  }
-}
-
-test('issue #284 maps a normal selection to the matching generated vision twin', () => {
-  assert.deepEqual(resolveVisionModePair(groups, {
-    provider: 'opencode-go',
-    model: 'qwen3.6-plus',
-    reasoningEffort: 'high',
-  }), {
-    mode: 'off',
-    target: {
-      provider: 'opencode-go-vision',
-      model: 'qwen3.6-plus',
-      reasoningEffort: 'high',
+  const { plugin, ctx, localeRegistrations } = createBoundaryHarness({
+    pluginApply(innerCtx) {
+      innerCtx.locale.register('vision-router', dictionaries)
     },
   })
+  plugin.apply(ctx)
+
+  assert.equal(localeRegistrations.length, 1)
+  assert.equal(localeRegistrations[0].namespace, 'vision-router')
+  // No runtime copy patching: the exact registered dictionary object ships.
+  assert.equal(localeRegistrations[0].dictionaries, dictionaries)
 })
 
-test('issue #284 maps a generated vision twin back to its source route', () => {
-  assert.deepEqual(resolveVisionModePair(groups, {
-    provider: 'opencode-go-vision',
-    model: 'minimax-m2.7',
-  }), {
-    mode: 'on',
-    target: { provider: 'opencode-go', model: 'minimax-m2.7' },
-  })
-})
-
-test('issue #284 maps default DeepSeek through the built-in deepseek-vision wrapper', () => {
-  assert.deepEqual(resolveVisionModePair(deepseekGroups(), {
-    provider: 'deepseek-official',
-    model: 'deepseek-v4-pro',
-    reasoningEffort: 'high',
-  }), {
-    mode: 'off',
-    target: {
-      provider: 'deepseek-vision',
-      model: 'deepseek-v4-pro',
-      reasoningEffort: 'high',
-    },
-  })
-  assert.deepEqual(resolveVisionModePair(deepseekGroups(), {
-    provider: 'deepseek-vision',
-    model: 'deepseek-v4-pro',
-  }), {
-    mode: 'on',
-    target: { provider: 'deepseek-official', model: 'deepseek-v4-pro' },
-  })
-})
-
-test('issue #284 follows a custom configured DeepSeek wrapper route in both directions', () => {
-  const wrapperRoute = 'relay-auto-vision'
-  const config = { wrapperRoute }
-  assert.deepEqual(resolveVisionModePair(deepseekGroups(wrapperRoute), {
-    provider: 'deepseek-official',
-    model: 'deepseek-v4-flash',
-  }, config), {
-    mode: 'off',
-    target: { provider: wrapperRoute, model: 'deepseek-v4-flash' },
-  })
-  assert.deepEqual(resolveVisionModePair(deepseekGroups(wrapperRoute), {
-    provider: wrapperRoute,
-    model: 'deepseek-v4-flash',
-  }, config), {
-    mode: 'on',
-    target: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-  })
-})
-
-test('issue #284 rejects lookalikes and exact-model mismatches', () => {
-  const lookalike = [
-    { id: 'third-party', name: 'Third Party', models: [{ id: 'm', name: 'M' }] },
-    { id: 'third-party-vision', name: 'Third Party Vision Native', models: [{ id: 'm', name: 'M' }] },
-  ]
-  assert.deepEqual(resolveVisionModePair(lookalike, {
-    provider: 'third-party',
-    model: 'm',
-  }), { mode: 'unavailable' })
-
-  assert.deepEqual(resolveVisionModePair([
-    { id: 'provider', name: 'Provider', models: [{ id: 'a', name: 'A' }] },
-    { id: 'provider-vision', name: 'Provider + 自动识图', models: [{ id: 'b', name: 'B' }] },
-  ], {
-    provider: 'provider',
-    model: 'a',
-  }), { mode: 'unavailable' })
-})
-
-test('issue #284 browser prelude wires the right-slot toggle to shared directory and settings scopes', async () => {
-  const harness = createBrowserHarness()
-  assert.deepEqual(Array.from(harness.dependencyInjection.dependencies), ['slots', 'modelDirectories', 'sessions', 'remote'])
-  assert.equal(harness.slotName, 'conversation.input.right')
-  assert.equal(harness.registration.id, 'vision-router-mode-toggle')
-
-  const offButton = buttonOf(harness.render())
-  assert.equal(offButton.props['aria-pressed'], false)
-  assert.equal(offButton.props.disabled, false)
-  assert.equal(offButton.props['data-vision-router-mode-toggle'], 'true')
-  // One fixed 14px leading slot carries the state icon, so both states render
-  // identical geometry: appending a check only while active used to change the
-  // chip width by ~18px and reflow the trailing composer row.
-  assert.equal(offButton.children.length, 2)
-  assert.equal(offButton.children[0]?.type, 'span')
-  // The fixed 14px box lives in the chip stylesheet, which also owns the 460px collapse;
-  // the markup carries the class both select.
-  assert.equal(offButton.children[0]?.props.className, 'vr-vision-toggle-glyph')
-  // One 14px slot, two glyphs: the Vision eye and the check that marks the enabled state.
-  // The chip stylesheet shows the check only while the label is there to explain it.
-  assert.equal(offButton.children[0]?.children.length, 2)
-  assert.equal(offButton.children[0]?.children[0]?.props.className, 'vr-vision-toggle-glyph-part vr-vision-toggle-glyph-eye')
-  assert.equal(offButton.children[0]?.children[0]?.children[0]?.type, 'svg')
-  assert.equal(offButton.children[0]?.children[0]?.children[0]?.props.width, 14)
-  assert.equal(offButton.children[0]?.children[0]?.children[0]?.props.height, 14)
-  assert.equal(offButton.children[0]?.children[0]?.children[0]?.children[0]?.props.fill, 'currentColor')
-  assert.equal(offButton.children[0]?.children[1]?.props.className, 'vr-vision-toggle-glyph-part vr-vision-toggle-glyph-check')
-  assert.equal(offButton.children[0]?.children[1]?.children[0]?.children[0]?.props.stroke, 'currentColor')
-  offButton.props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(harness.selections.at(-1)?.provider, 'opencode-go-vision')
-  assert.equal(harness.selections.at(-1)?.reasoningEffort, 'high')
-
-  const onButton = buttonOf(harness.render())
-  assert.equal(onButton.props['aria-pressed'], true)
-  assert.equal(onButton.props['aria-busy'], false)
-  assert.equal(onButton.props.disabled, false)
-  assert.equal(onButton.children.length, 2)
-  assert.equal(onButton.children[0]?.type, 'span')
-  assert.equal(onButton.children[0]?.props.className, 'vr-vision-toggle-glyph')
-  // Same slot in both states; the stylesheet is what swaps eye for check, and only while the
-  // label is present (<=460px keeps the eye so a collapsed chip still says what it does).
-  assert.equal(onButton.children[0]?.children.length, 2)
-  assert.equal(onButton.children[0]?.children[0]?.props.className, 'vr-vision-toggle-glyph-part vr-vision-toggle-glyph-eye')
-  assert.equal(onButton.children[0]?.children[0]?.children[0]?.props.width, 14)
-  assert.equal(onButton.children[0]?.children[1]?.props.className, 'vr-vision-toggle-glyph-part vr-vision-toggle-glyph-check')
-  // The selected treatment is the shipped ghost-active token pair, pinned by the chip
-  // stylesheet instead of an inline brand shadow.
-  assert.equal(onButton.props['data-active'], 'true')
-  onButton.props.onClick()
-  await Promise.resolve()
-  assert.equal(harness.selections.at(-1)?.provider, 'opencode-go')
-  assert.equal(harness.selections.at(-1)?.reasoningEffort, 'high')
-})
-
-test('issue #284 browser toggle follows the live configured DeepSeek wrapper route', async () => {
-  const wrapperRoute = 'relay-auto-vision'
-  const harness = createBrowserHarness({
-    modelGroups: deepseekGroups(wrapperRoute),
-    current: { provider: 'deepseek-official', model: 'deepseek-v4-pro' },
-    wrapperRoute,
-  })
-  const button = buttonOf(harness.render())
-  assert.equal(button.props.disabled, false)
-  button.props.onClick()
-  await Promise.resolve()
-  assert.equal(harness.selections.at(-1)?.provider, wrapperRoute)
-
-  harness.setSettings({ status: 'ready', value: { wrapperRoute: 'next-auto-vision' } })
-  harness.setSnapshot({
-    current: { provider: wrapperRoute, model: 'deepseek-v4-pro' },
-    groups: deepseekGroups(wrapperRoute),
-    status: 'ready',
-    error: null,
-  })
-  assert.equal(buttonOf(harness.render()).props.disabled, true)
-})
-
-test('Vision mode serializes a Host RPC that remains pending after the directory reports ready', async () => {
-  const harness = createBrowserHarness({ deferCompletion: true })
-  const off = buttonOf(harness.render())
-  off.props.onClick()
-  assert.equal(harness.selections.length, 1)
-  assert.equal(harness.getSnapshot().status, 'ready')
-  assert.equal(harness.getSnapshot().current.provider, 'opencode-go-vision')
-
-  // A rerender can show the target state before the Host RPC resolves.
-  // The chip must stay busy/disabled and refuse both a stale pre-render
-  // click and a second current button click.
-  const pending = buttonOf(harness.render())
-  assert.equal(pending.props['aria-pressed'], true)
-  assert.equal(pending.props['aria-busy'], true)
-  assert.equal(pending.props.disabled, true)
-  off.props.onClick()
-  pending.props.onClick()
-  assert.equal(harness.selections.length, 1)
-
-  harness.resolveCompletion()
-  await new Promise((resolve) => setImmediate(resolve))
-  const ready = buttonOf(harness.render())
-  assert.equal(ready.props['aria-pressed'], true)
-  assert.equal(ready.props['aria-busy'], false)
-  assert.equal(ready.props.disabled, false)
-  ready.props.onClick()
-  assert.equal(harness.selections.length, 2)
-  assert.equal(harness.selections[1].provider, 'opencode-go')
-  await new Promise((resolve) => setImmediate(resolve))
-  const reverted = buttonOf(harness.render())
-  assert.equal(reverted.props['aria-pressed'], false)
-  assert.equal(reverted.props.disabled, false)
-})
-
-test('issue #684 rejected return selection retains authoritative ON and shows failure', async () => {
-  const harness = createBrowserHarness({ returnSelectionFailureAt: 2 })
-  buttonOf(harness.render()).props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(buttonOf(harness.render()).props['aria-pressed'], true)
-
-  buttonOf(harness.render()).props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(harness.selections.length, 2)
-  assert.equal(harness.selections[1].provider, 'opencode-go')
-  const rendered = harness.render()
-  assert.equal(buttonOf(rendered).props['aria-pressed'], true)
-  assert.equal(buttonOf(rendered).props.disabled, false)
-  assert.match(firstChildOfType(rendered, harness.primitives.Toast)?.props.text ?? '', /session\/writer-held/)
-})
-
-test('issue #684 successful return RPC with stale projection never invents OFF', async () => {
-  const harness = createBrowserHarness({ staleProjectionAt: 2 })
-  buttonOf(harness.render()).props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(buttonOf(harness.render()).props['aria-pressed'], true)
-
-  buttonOf(harness.render()).props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(harness.selections.length, 2)
-  assert.equal(harness.selections[1].provider, 'opencode-go')
-  assert.equal(harness.getSnapshot().status, 'ready')
-  assert.equal(harness.getSnapshot().current.provider, 'opencode-go-vision')
-  assert.equal(buttonOf(harness.render()).props['aria-pressed'], true)
-  assert.equal(buttonOf(harness.render()).props.disabled, false)
-})
-
-
-
-test('issue #684 fault matrix: rejected OFF selection can look ON/actionable after Host error clears', async () => {
-  const harness = createBrowserHarness({ returnSelectionFailureAt: 2 })
-  buttonOf(harness.render()).props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(buttonOf(harness.render()).props['aria-pressed'], true)
-
-  buttonOf(harness.render()).props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(harness.selections[1].provider, 'opencode-go')
-  assert.equal(harness.getSnapshot().status, 'error')
-  assert.match(firstChildOfType(harness.render(), harness.primitives.Toast)?.props.text ?? '', /session\/writer-held/)
-
-  // An independent Host directory refresh clears the error after rejection.
-  // The final toggle matches #684's observed ON/ready/actionable state, but
-  // the preserved failure toast distinguishes this from lost projection.
-  harness.setSnapshot({ ...harness.getSnapshot(), status: 'ready', error: null, pending: null })
-  const recovered = harness.render()
-  assert.equal(buttonOf(recovered).props['aria-pressed'], true)
-  assert.equal(buttonOf(recovered).props['aria-busy'], false)
-  assert.equal(buttonOf(recovered).props.disabled, false)
-  assert.match(firstChildOfType(recovered, harness.primitives.Toast)?.props.text ?? '', /session\/writer-held/)
-  assert.equal(harness.selections.length, 2)
-})
-
-test('issue #684 fault matrix: reset while OFF RPC pending can leave ON/actionable after accepted RPC', async () => {
-  const harness = createBrowserHarness({ deferSelectionAt: 2, staleProjectionAt: 2 })
-  buttonOf(harness.render()).props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(buttonOf(harness.render()).props['aria-pressed'], true)
-
-  buttonOf(harness.render()).props.onClick()
-  assert.equal(harness.selections.length, 2)
-  assert.equal(harness.selections[1].provider, 'opencode-go')
-  assert.equal(harness.getSnapshot().status, 'selecting')
-  assert.equal(buttonOf(harness.render()).props['aria-busy'], true)
-
-  // Mirror upstream ModelDirectory.resetConnected(): clear pending, briefly
-  // enter loading and restore the earlier authoritative ON projection.
-  const before = harness.getSnapshot()
-  harness.setSnapshot({ ...before, status: 'loading', pending: null, error: null })
-  assert.equal(buttonOf(harness.render()).props.disabled, true)
-  harness.setSnapshot({ ...before, status: 'ready', pending: null, error: null })
-  harness.resolveSelection()
-  await new Promise((resolve) => setImmediate(resolve))
-
-  const after = harness.render()
-  assert.equal(harness.getSnapshot().current.provider, 'opencode-go-vision')
-  assert.equal(buttonOf(after).props['aria-pressed'], true)
-  assert.equal(buttonOf(after).props['aria-busy'], false)
-  assert.equal(buttonOf(after).props.disabled, false)
-  assert.equal(firstChildOfType(after, harness.primitives.Toast), undefined)
-  assert.equal(harness.selections.length, 2)
-
-  // Delayed authoritative projection does recover the button without any
-  // additional RPC, which argues against a separately cached plugin boolean.
-  harness.setSnapshot({ ...harness.getSnapshot(), current: harness.selections[1] })
-  assert.equal(buttonOf(harness.render()).props['aria-pressed'], false)
-  assert.equal(harness.selections.length, 2)
-})
-
-test('issue #684 fault matrix: catalog hydration during second RPC cannot invent OFF', async () => {
-  const harness = createBrowserHarness({ deferSelectionAt: 2, staleProjectionAt: 2 })
-  buttonOf(harness.render()).props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-  buttonOf(harness.render()).props.onClick()
-  assert.equal(harness.selections[1].provider, 'opencode-go')
-
-  const previous = harness.getSnapshot()
-  harness.setSnapshot({ ...previous, status: 'loading', pending: null, error: null })
-  assert.equal(buttonOf(harness.render()).props['aria-busy'], true)
-  harness.setSnapshot({ ...previous, status: 'ready', pending: null, error: null })
-  harness.resolveSelection()
-  await new Promise((resolve) => setImmediate(resolve))
-
-  const stalled = harness.render()
-  assert.equal(buttonOf(stalled).props['aria-pressed'], true)
-  assert.equal(buttonOf(stalled).props['aria-busy'], false)
-  assert.equal(buttonOf(stalled).props.disabled, false)
-
-  // If the catalog reload is followed by the correct Session projection,
-  // the toggle follows it; no local optimistic mode is present.
-  harness.setSnapshot({ ...harness.getSnapshot(), current: harness.selections[1] })
-  assert.equal(buttonOf(harness.render()).props['aria-pressed'], false)
-})
-
-test('issue #284 image-session rejection uses transient toast and keeps the real ON state usable', async () => {
-  const error = 'model-unavailable: Model "qwen3.6-plus" does not accept image input, but this session already contains images; select an image-capable model.'
-  const harness = createBrowserHarness({
-    current: { provider: 'opencode-go-vision', model: 'qwen3.6-plus', reasoningEffort: 'high' },
-    rejectSelection: error,
-  })
-
-  const before = buttonOf(harness.render())
-  assert.equal(before.props['aria-pressed'], true)
-  assert.equal(before.children[0]?.children.length, 2)
-  assert.equal(before.children[0]?.children[0]?.children[0]?.type, 'svg')
-  assert.equal(before.children[0]?.children[0]?.children[0]?.children[0]?.props.fill, 'currentColor')
-  before.props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-
-  assert.equal(harness.getSnapshot().current.provider, 'opencode-go-vision')
-  assert.equal(harness.getSnapshot().status, 'error')
-
-  const rendered = harness.render()
-  const button = buttonOf(rendered)
-  const toast = firstChildOfType(rendered, harness.primitives.Toast)
-  assert.equal(button.props['aria-pressed'], true)
-  assert.equal(button.props.disabled, false)
-  assert.equal(button.children[0]?.children[0]?.children[0]?.type, 'svg')
-  assert.equal(button.children[0]?.children[0]?.children[0]?.children[0]?.props.fill, 'currentColor')
-  assert.equal(button.children[1].children[0], '识图')
-  assert.equal(button.children.length, 2)
-  assert.equal(button.props.title, '关闭识图模式')
-  assert.ok(toast)
-  assert.equal(toast.props.text, `模型操作失败：${error}`)
-  assert.equal(toast.props.anchor, null)
-
-  button.props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(harness.selections.length, 2)
-})
-
-test('issue #284 treats resolved Host RemoteResult failures as rejected selections', async () => {
-  const error = 'session/writer-held: Another writer temporarily owns this session.'
-  const harness = createBrowserHarness({
-    current: { provider: 'opencode-go', model: 'qwen3.6-plus', reasoningEffort: 'high' },
-    returnSelectionFailure: error,
-  })
-
-  const before = buttonOf(harness.render())
-  assert.equal(before.props['aria-pressed'], false)
-  before.props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-
-  assert.equal(harness.getSnapshot().current.provider, 'opencode-go')
-  assert.equal(harness.getSnapshot().status, 'error')
-
-  const rendered = harness.render()
-  const toast = firstChildOfType(rendered, harness.primitives.Toast)
-  assert.ok(toast)
-  assert.equal(toast.props.text, `模型操作失败：${error}`)
-})
-
-test('issue #684 retains an actionable cached complete pair through Host catalog refresh', async () => {
-  const harness = createBrowserHarness()
-  const initial = buttonOf(harness.render())
-  assert.equal(initial.props.disabled, false)
-  // The real Host keeps last-good groups/current while reloading after a
-  // settings document or adapter event. Its selection RPC is still authoritative.
-  harness.setSnapshot({ ...harness.getSnapshot(), status: 'loading', pending: null, routable: null })
-  const refreshing = buttonOf(harness.render())
-  assert.equal(refreshing.props['aria-pressed'], false)
-  assert.equal(refreshing.props.disabled, false)
-  assert.equal(refreshing.props['aria-busy'], false)
-  assert.equal(refreshing.props['data-dimmed'], 'false')
-  refreshing.props.onClick()
-  assert.equal(harness.selections.length, 1)
-  assert.equal(harness.selections[0].provider, 'opencode-go-vision')
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(buttonOf(harness.render()).props['aria-pressed'], true)
-})
-
-test('issue #684 never bypasses cold/reset, incomplete, rejected, or pending Host catalogs', () => {
-  const harness = createBrowserHarness()
-  const base = harness.getSnapshot()
-  const cases = [
-    { status: 'idle', current: base.current, groups, pending: null },
-    { status: 'loading', current: null, groups: [], pending: null },
-    { status: 'loading', current: base.current, groups: [groups[0]], pending: null },
-    { status: 'loading', current: base.current, groups, pending: { provider: 'opencode-go-vision', model: 'qwen3.6-plus' } },
-    { status: 'loading', current: base.current, groups, pending: null, routable: false },
-    { status: 'loading', current: base.current, groups, pending: null, error: 'catalog unavailable' },
-  ]
-  for (const variant of cases) {
-    harness.setSnapshot({ ...base, ...variant })
-    const button = buttonOf(harness.render())
-    assert.equal(button.props.disabled, true, JSON.stringify(variant))
-    assert.equal(button.props['aria-busy'], true, JSON.stringify(variant))
-    button.props.onClick()
-    assert.equal(harness.selections.length, 0, 'no RPC may bypass an incomplete Host catalog')
-  }
-})
-
-test('issue #284 distinguishes initial model loading from a genuinely unavailable pair', () => {
-  const harness = createBrowserHarness()
-  harness.setSnapshot({ current: null, groups: [], status: 'loading', error: null })
-  const button = buttonOf(harness.render())
-  assert.equal(button.props.disabled, true)
-  assert.equal(button.props.title, '加载中')
-})
-
-test('issue #284 patches onboarding copy and accurately explains the guide spotlight', () => {
-  const harness = createBrowserHarness()
-  const main = harness.localeRegistrations.find((entry) => entry.namespace === 'vision-router')
-  assert.ok(main)
-  assert.equal(main.dictionaries.zh.quickStartTitle, '聊天模型 + 识图模式')
-  assert.match(main.dictionaries.zh.quickStartBody, /它变成选中态（高亮底色）表示已开启/)
-  assert.match(main.dictionaries.zh.onboardingStep1Title, /开启识图/)
-  assert.match(main.dictionaries.zh.onboardingStep1Body, /模型选择器左侧的「识图」/)
-  assert.match(main.dictionaries.zh.guideStep1Body, /^高亮的是聊天模型选择器/)
-  assert.equal(main.dictionaries.zh.guideStep1Body.includes('和「识图」按钮已经被高亮'), false)
-  assert.match(main.dictionaries.en.quickStartBody, /lights up in its selected state to mean it is on/)
-})
-
-test('issue #357 uses fixed SVG icons instead of platform-dependent text glyphs', () => {
-  const harness = createBrowserHarness()
-  const offButton = buttonOf(harness.render())
-  assert.equal(offButton.children[0]?.type, 'span')
-  assert.equal(offButton.children[0]?.children.length, 2)
-  assert.equal(offButton.children[0]?.children[0]?.props.className, 'vr-vision-toggle-glyph-part vr-vision-toggle-glyph-eye')
-  assert.equal(offButton.children[0]?.children[0]?.children[0]?.type, 'svg')
-  assert.equal(offButton.children[0]?.children[0]?.children[0]?.props.viewBox, '0 0 14 14')
-  assert.equal(offButton.children[0]?.children[0]?.children[0]?.children[0]?.props.fill, 'currentColor')
-  assert.equal(offButton.children[0]?.children[1]?.props.className, 'vr-vision-toggle-glyph-part vr-vision-toggle-glyph-check')
-
-  harness.setSnapshot({
-    current: { provider: 'opencode-go-vision', model: 'qwen3.6-plus', reasoningEffort: 'high' },
-    groups,
-    status: 'ready',
-    error: null,
-  })
-  const onButton = buttonOf(harness.render())
-  assert.equal(onButton.children[0]?.children[0]?.children[0]?.type, 'svg')
-  assert.equal(onButton.children[0]?.children[0]?.children[0]?.props.viewBox, '0 0 14 14')
-  // Both states ship both glyphs; the stylesheet swaps them, and the negative form of each
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("}, '👁')"), false)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("}, '✓')"), false)
-})
-
-test('issue #284 smooths only the directory reload owned by this Vision toggle', async () => {
-  const harness = createBrowserHarness({ deferSelection: true })
-  const offButton = buttonOf(harness.render())
-  assert.equal(offButton.props.disabled, false)
-
-  offButton.props.onClick()
-  const target = harness.selections.at(-1)
-  assert.equal(target?.provider, 'opencode-go-vision')
-  assert.equal(target?.model, 'qwen3.6-plus')
-  assert.equal(target?.reasoningEffort, 'high')
-
-  // The official directory owns the transaction. Once its pending selection
-  // matches our target, remember only the settled presentation while that same
-  // transaction moves through an incomplete generation.
-  harness.setSnapshot({
-    current: target,
-    groups,
-    status: 'selecting',
-    pending: target,
-    error: null,
-  })
-  const selecting = buttonOf(harness.render())
-  assert.equal(selecting.props['aria-pressed'], true)
-  assert.equal(selecting.props.disabled, true)
-  assert.equal(selecting.props['aria-busy'], true)
-
-  harness.setSnapshot({
-    current: target,
-    groups: [groups[1]],
-    status: 'loading',
-    pending: target,
-    error: null,
-  })
-  const partial = buttonOf(harness.render())
-  assert.equal(partial.props['aria-pressed'], true)
-  assert.equal(partial.props.disabled, true)
-  assert.equal(partial.props['aria-busy'], true)
-  assert.equal(partial.props.title, '切换中')
-  // Waiting on this toggle's own selection must not grey the chip: only the
-  // unavailable/loading states set the dimming attribute.
-  assert.equal(partial.props['data-dimmed'], 'false')
-  assert.equal(partial.children[0]?.props.className, 'vr-vision-toggle-glyph')
-
-  harness.setSnapshot({ current: null, groups: [], status: 'idle', pending: target, error: null })
-  const empty = buttonOf(harness.render())
-  assert.equal(empty.props['aria-pressed'], true)
-  assert.equal(empty.props.disabled, true)
-  assert.equal(empty.props['data-dimmed'], 'false')
-
-  harness.resolveSelection()
-  await new Promise((resolve) => setImmediate(resolve))
-  harness.setSnapshot({ current: target, groups, status: 'ready', pending: null, error: null })
-  const ready = buttonOf(harness.render())
-  assert.equal(ready.props['aria-pressed'], true)
-  assert.equal(ready.props.disabled, false)
-  assert.equal(ready.props['aria-busy'], false)
-
-  // The same directory object is also reloaded by connection, adapter,
-  // settings and credential updates. Without an owned toggle transaction,
-  // incomplete generations stay authoritative instead of reusing stale ON.
-  harness.setSnapshot({
-    current: target,
-    groups: [groups[1]],
-    status: 'loading',
-    pending: null,
-    error: null,
-  })
-  const externalPartial = buttonOf(harness.render())
-  assert.equal(externalPartial.props['aria-pressed'], false)
-  assert.equal(externalPartial.props.disabled, true)
-  assert.equal(externalPartial.props['aria-busy'], true)
-  assert.equal(externalPartial.props.title, '加载中')
-  assert.equal(externalPartial.props['data-dimmed'], 'true')
-
-  harness.setSnapshot({ current: null, groups: [], status: 'loading', pending: null, error: null })
-  const resetLoading = buttonOf(harness.render())
-  assert.equal(resetLoading.props['aria-pressed'], false)
-  assert.equal(resetLoading.props.disabled, true)
-  assert.equal(resetLoading.props['data-dimmed'], 'true')
-})
-
-test('issue #284 remains explicit and persistent with no send/image auto-reset hook', () => {
-  const source = readFileSync(new URL('../lib/client-presentation-boundary.js', import.meta.url), 'utf8')
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("ctx.inject(['slots', 'modelDirectories', 'sessions', 'remote']"), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("scope.slots.inject('conversation.input.right'"), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("id: 'vision-router-mode-toggle'"), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("'data-vision-router-mode-toggle': 'true'"), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("require('@deepseek-ai/dsh-client-ui-primitives')"), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("failed: '模型操作失败：{message}'"), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("fill: 'currentColor'"), true)
-  // Both glyphs ship as fixed SVG: the filled eye and the stroked check.
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("stroke: 'currentColor'"), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes(".vr-vision-toggle-glyph-check{display:none}"), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("@container (min-width:460.01px)"), true)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("}, '👁')"), false)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes("}, '✓')"), false)
-  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes('failedShort'), false)
-  assert.equal(source.includes('send-committed'), false)
-  assert.equal(source.includes('conversation.input.attachments'), false)
-  assert.equal(source.includes('imageIds'), false)
-})
-
-
-function create684Harness() {
-  let ms = 0
-  let button = make684Button()
-  let deliver
-  const globals = {
-    window: {},
-    document: {
-      body: {},
-      querySelector: () => button,
-    },
-    performance: { now: () => ms },
-    MutationObserver: class {
-      constructor(callback) { deliver = callback }
-      observe() {}
-    },
-  }
-  vm.runInNewContext('(' + installDesktopVisionToggleAudit.toString() + ')()', globals)
-  const audit = globals.window.__dvrDesktopToggleAudit
-  return {
-    audit,
-    tick(value) { ms = value },
-    mutate(patch) {
-      Object.assign(button, patch)
-      deliver([{ type: 'attributes', target: button, attributeName: 'aria-busy' }])
-    },
-    replace() {
-      button = make684Button()
-      deliver([{ type: 'childList', addedNodes: [button], removedNodes: [] }])
-    },
-    missing() {
-      button = null
-      deliver([{ type: 'childList', addedNodes: [], removedNodes: [] }])
-    },
-  }
-}
-
-function make684Button() {
-  return {
-    pressed: 'false',
-    busy: 'false',
-    disabled: false,
-    getAttribute(key) {
-      if (key === 'aria-pressed') return this.pressed
-      if (key === 'aria-busy') return this.busy
-      return null
-    },
-    matches: (selector) => selector === '[data-vision-router-mode-toggle="true"]',
-    querySelector: () => null,
-  }
-}
-
-test('issue #684 requires an uninterrupted 300ms ready interval, not two matching samples', () => {
-  const { audit, tick, mutate } = create684Harness()
-  assert.equal(audit.stableFor('false', 300), false)
-  tick(299)
-  assert.equal(audit.stableFor('false', 300), false)
-  tick(300)
-  assert.equal(audit.stableFor('false', 300), true)
-
-  // Old gate would see ready at t=300 and t=600, missing this busy pulse.
-  tick(350)
-  mutate({ busy: 'true' })
-  tick(351)
-  mutate({ busy: 'false' })
-  tick(600)
-  assert.equal(audit.stableFor('false', 300), false)
-  tick(899)
-  assert.equal(audit.stableFor('false', 300), false)
-  tick(900)
-  assert.equal(audit.stableFor('false', 300), true)
-  assert.ok(audit.stabilitySummary().observedMutations >= 2)
-})
-
-test('issue #684 restarts the ready window on button replacement and target reversal', () => {
-  const { audit, tick, replace, mutate } = create684Harness()
-  assert.equal(audit.stableFor('false', 300), false)
-  tick(300)
-  assert.equal(audit.stableFor('false', 300), true)
-  tick(320)
-  replace()
-  assert.equal(audit.stableFor('false', 300), false)
-  tick(620)
-  assert.equal(audit.stableFor('false', 300), true)
-
-  tick(621)
-  assert.equal(audit.stableFor('true', 300), false)
-  mutate({ pressed: 'true' })
-  tick(921)
-  assert.equal(audit.stableFor('true', 300), false)
-  tick(1221)
-  assert.equal(audit.stableFor('true', 300), true)
-})
-
-test('issue #684 refuses absent or disabled buttons, keeping history bounded', () => {
-  const { audit, tick, mutate, missing } = create684Harness()
-  for (let i = 0; i < 70; i++) {
-    tick(i)
-    mutate({ disabled: i % 2 === 0 })
-  }
-  assert.ok(audit.history.length <= 48)
-  assert.equal(audit.stableFor('false', 300), false)
-  tick(500)
-  missing()
-  assert.equal(audit.stableFor('false', 300), false)
-})
-
-
-test('issue #684 records every client directory transition and never logs raw errors', () => {
-  let state = { current: { provider: 'desktop-e2e', model: 'desktop-text' }, pending: null, status: 'ready', error: null }
-  const listeners = []
-  const store = {
-    getSnapshot: () => state,
-    subscribe: (listener) => { listeners.push(listener); return () => {} },
-  }
-  const directory = { store }
-  const button = { '__reactFiber$probe': { memoizedProps: { directory }, return: null } }
-  const sandbox = {
-    window: {},
-    document: { querySelector: () => button },
-    performance: { now: () => 123 },
-  }
-  vm.runInNewContext('(' + installDesktopModelSelectionTrace.toString() + ')()', sandbox)
-  const trace = sandbox.window.__dvrDesktopModelTrace
-  assert.equal(trace.available, true)
-  assert.equal(trace.history.length, 1)
-
-  state = { ...state, status: 'selecting', pending: { provider: 'desktop-e2e-vision', model: 'desktop-text' } }
-  listeners.forEach((fn) => fn())
-  state = { ...state, status: 'error', pending: null, error: 'session/model-unavailable: secret payload should never be logged' }
-  listeners.forEach((fn) => fn())
-  assert.equal(trace.history[2].errorCode, 'session/model-unavailable')
-  assert.equal(trace.history[2].errorOrigin, null)
-  assert.equal(trace.history[2].hasError, true)
-  assert.equal(JSON.stringify(trace.history).includes('secret payload'), false)
-
-  // Same gateway/internal code, three distinct source classes and a safe
-  // unknown fallback. Only fixed enums go into the bounded trace.
-  for (const [message, expectedOrigin] of [
-    ['gateway/internal: client api: session/selectModel failed: socket secret=abc', 'client-carrier'],
-    ['gateway/internal: client api: Remote method session/selectModel is no longer mounted', 'client-withdrawn'],
-    ['gateway/internal: resume failed for session "private-id": token xyz', 'host-resume'],
-    ['gateway/internal: unknown Host implementation error with user data', 'undetermined'],
+test('issue #284 retirement: the generic image preview surfaces survive the toggle removal', () => {
+  for (const retained of [
+    'function PresentedImage(props)',
+    'function ImageGallery(props)',
+    '__dvrPresentFocus',
+    'installClipboardImagePasteCompat',
+    'function scopedRequire(id) {',
   ]) {
-    state = { ...state, status: 'error', error: message }
-    listeners.forEach((fn) => fn())
-    assert.equal(trace.history.at(-1).errorCode, 'gateway/internal')
-    assert.equal(trace.history.at(-1).errorOrigin, expectedOrigin)
-    assert.equal(JSON.stringify(trace.history).includes(message), false)
+    assert.ok(CLIENT_PRESENTATION_PRELUDE.includes(retained), `prelude must retain ${retained}`)
   }
-  assert.equal(JSON.stringify(trace.history).includes('private-id'), false)
-  assert.equal(JSON.stringify(trace.history).includes('secret=abc'), false)
-  assert.equal(trace.history[1].pending.provider, 'desktop-e2e-vision')
-  assert.equal(trace.directoryChanged(), false)
-
-  for (let i = 0; i < 80; i++) listeners.forEach((fn) => fn())
-  assert.equal(trace.history.length, 64)
+  // The legacy attachment value seam still works through the loader factory.
+  const harness = createBoundaryHarness()
+  assert.equal(typeof harness.plugin.apply, 'function')
+  const html = injectClientPresentationBoundary('<html><head></head><body></body></html>')
+  assert.match(html, /data-vision-router-presentation-boundary/)
+  assert.equal((html.match(/data-vision-router-presentation-boundary/g) ?? []).length, 1)
 })
 
-test('issue #684 client directory transition trace is explicit when React internals are absent', () => {
-  const sandbox = {
-    window: {},
-    document: { querySelector: () => ({}) },
-  }
-  vm.runInNewContext('(' + installDesktopModelSelectionTrace.toString() + ')()', sandbox)
-  assert.equal(sandbox.window.__dvrDesktopModelTrace.available, false)
-  assert.equal(sandbox.window.__dvrDesktopModelTrace.reason, 'react-fiber-unavailable')
+test('issue #284 retirement: no vision-mode copy patch ships on the #271 guide mutation fence path', () => {
+  // The guide mutation fence itself stays: it protects the settings walkthrough
+  // observer, which now teaches the /vision command.
+  assert.ok(CLIENT_PRESENTATION_PRELUDE.includes('installGuideMutationFence'))
+  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes('patchVisionModeCopy'), false)
+  assert.equal(CLIENT_PRESENTATION_PRELUDE.includes('bindVisionModeSettings'), false)
 })
-
-
-test('issue #684 preserves two DOM clicks and the expiring rejection alert without storing message bodies', () => {
-  let now = 100
-  let mutation
-  let onClick
-  let alerts = []
-  const button = make684Button()
-  const globals = {
-    window: {},
-    document: {
-      body: {},
-      querySelector: () => button,
-      querySelectorAll: (selector) => selector === '[role="alert"]' ? alerts : [],
-      addEventListener(type, callback, capture) {
-        assert.ok(['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].includes(type))
-        assert.equal(capture, true)
-        if (type === 'click') onClick = callback
-      },
-    },
-    performance: { now: () => now },
-    MutationObserver: class {
-      constructor(callback) { mutation = callback }
-      observe() {}
-    },
-  }
-  vm.runInNewContext('(' + installDesktopVisionToggleAudit.toString() + ')()', globals)
-  const audit = globals.window.__dvrDesktopToggleAudit
-  const deliverClick = () => onClick({ target: { closest: () => button } })
-  const flush = () => mutation([{ type: 'childList', addedNodes: [], removedNodes: [] }])
-  deliverClick()
-  assert.equal(audit.domClicks.length, 1)
-  assert.equal(audit.domClicks[0].pressed, 'false')
-  assert.equal(audit.domClicks[0].disabled, false)
-
-  now = 140
-  const node = { textContent: 'Model action failed: session/model-unavailable: secret API TOKEN DO NOT LOG' }
-  alerts = [node]
-  flush()
-  assert.equal(audit.alertHistory.at(-1).phase, 'visible')
-  assert.equal(audit.alertHistory.at(-1).errorCode, 'session/model-unavailable')
-  assert.equal(JSON.stringify(audit.alertHistory).includes('secret API TOKEN'), false)
-
-  now = 4200
-  alerts = []
-  flush()
-  assert.equal(audit.alertHistory.at(-1).phase, 'removed')
-  assert.equal(audit.alertHistory.at(-1).errorCode, 'session/model-unavailable')
-  for (let i = 0; i < 75; i++) {
-    now++
-    deliverClick()
-    alerts = [{ textContent: 'session/model-unavailable: SECRET VALUE '+i }]
-    flush()
-    alerts = []
-    flush()
-  }
-  assert.ok(audit.domClicks.length <= 8)
-  assert.ok(audit.alertHistory.length <= 32)
-  assert.equal(JSON.stringify(audit.alertHistory).includes('SECRET VALUE'), false)
-})
-
-test('issue #684 pointer audit detects press on Vision button retargeted to ancestor before click', () => {
-  let now = 1000
-  let button = make684Button()
-  button.getBoundingClientRect = () => ({ left: 10, right: 110, top: 20, bottom: 50, width: 100, height: 30 })
-  button.isConnected = true
-  button.closest = (selector) => selector === '[data-vision-router-mode-toggle="true"]' ? button : null
-  const ancestor = { isConnected: true, closest: () => null }
-  const listeners = new Map()
-  let mutation
-  const globals = {
-    window: {},
-    document: {
-      body: {},
-      querySelector: () => button,
-      querySelectorAll: () => [],
-      addEventListener(type, callback) {
-        const list = listeners.get(type) || []
-        list.push(callback)
-        listeners.set(type, list)
-      },
-      elementFromPoint: () => button || ancestor,
-    },
-    performance: { now: () => now },
-    MutationObserver: class {
-      constructor(callback) { mutation = callback }
-      observe() {}
-    },
-  }
-  vm.runInNewContext('(' + installDesktopVisionToggleAudit.toString() + ')()', globals)
-  const audit = globals.window.__dvrDesktopToggleAudit
-  const fire = (type, target) => {
-    for (const callback of listeners.get(type) || []) {
-      callback({ type, target, clientX: 50, clientY: 30 })
-    }
-  }
-  fire('pointerdown', button)
-  fire('mousedown', button)
-  now += 6
-  const previous = button
-  previous.isConnected = false
-  button = make684Button()
-  button.getBoundingClientRect = previous.getBoundingClientRect
-  button.isConnected = true
-  button.closest = previous.closest
-  mutation([{ type: 'childList', addedNodes: [button], removedNodes: [previous] }])
-  now += 7
-  fire('pointerup', ancestor)
-  fire('mouseup', ancestor)
-  fire('click', ancestor)
-  assert.equal(audit.domClicks.length, 0, 'React button onClick would never fire')
-  assert.equal(audit.pointerHistory.length, 5)
-  assert.equal(audit.pointerHistory[0].phase, 'pointerdown')
-  assert.equal(audit.pointerHistory[0].targetToggle, true)
-  assert.equal(audit.pointerHistory[0].targetConnected, true)
-  assert.equal(audit.pointerHistory.at(-1).phase, 'click')
-  assert.equal(audit.pointerHistory.at(-1).targetToggle, false)
-  assert.notEqual(audit.pointerHistory[0].currentNode, audit.pointerHistory.at(-1).currentNode)
-  assert.equal(audit.pointerHistory.at(-1).hitSameAsCurrent, true)
-  assert.equal(audit.pointerHistory.every(row => Object.keys(row).every(
-    key => !/text|credential|token|prompt|provider|session|url|coordinate|clientX|clientY/i.test(key)
-  )), true, 'pointer trace must not leak sensitive values or coordinates')
-});

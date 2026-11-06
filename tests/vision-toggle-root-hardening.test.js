@@ -1,538 +1,67 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import vm from 'node:vm'
+import { access } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 
 import { injectClientPresentationBoundary } from '../lib/client-presentation-boundary.js'
-import { injectVisionModelVisibilityBoundary } from '../lib/vision-model-visibility-boundary.js'
-import { VISION_MODEL_VISIBILITY_PRELUDE } from '../lib/vision-model-visibility-boundary-main.js'
-import { hardenVisionClientSource } from '../lib/vision-toggle-root-hardening.js'
-import {
-  createVisionToggleRootHardening,
-  hardenVisionToggleHtml,
-} from '../lib/vision-toggle-root-hardening.js'
-import { contextWithVisionRoutingTopologyRefresh } from '../lib/vision-routing-topology-refresh.js'
 
-function fakeHost(config, seeded = []) {
-  const registry = new Map(seeded.map(({ route, adapter }) => [route, adapter]))
-  const llm = {
-    registration(route) {
-      if (!registry.has(route)) throw new Error(`no adapter: ${route}`)
-      return { adapter: registry.get(route) }
-    },
-    listProviders() {
-      return [...registry].map(([route, adapter]) => {
-        try { return adapter.providerInfo(route) } catch { return { id: route, name: route } }
-      })
-    },
-    registerAdapter(routes, adapter) {
-      for (const route of routes) {
-        if (registry.has(route)) {
-          const error = new Error(`duplicate adapter: ${route}`)
-          error.code = 'DUPLICATE_ADAPTER'
-          throw error
-        }
-      }
-      let held = new Set(routes)
-      for (const route of held) registry.set(route, adapter)
-      const dispose = () => {
-        for (const route of held) registry.delete(route)
-        held = new Set()
-      }
-      dispose.replace = (next) => {
-        for (const route of next) {
-          if (!held.has(route) && registry.has(route)) {
-            const error = new Error(`duplicate adapter: ${route}`)
-            error.code = 'DUPLICATE_ADAPTER'
-            throw error
-          }
-        }
-        for (const route of held) registry.delete(route)
-        held = new Set(next)
-        for (const route of held) registry.set(route, adapter)
-      }
-      return dispose
-    },
+/**
+ * Root hardening after the P5 UI retirement (plan §5.2). The toggle root
+ * hardening existed to (a) hide unowned wrapper routes from settings and
+ * llm.listProviders, (b) expose a /route-ownership snapshot endpoint, and
+ * (c) rewrite the client scripts that consumed that ownership — the composer
+ * toggle, the model-visibility filter, and their selection recovery stores.
+ * All consumers are retired with the button, so the whole module — ownership
+ * view, endpoint, CLIENT_PRELUDE, and script rewriter — is deleted rather
+ * than left as dead authority. These tests pin the retirement contract.
+ */
+test('retirement: the root hardening and guide highlight modules are gone', async () => {
+  for (const path of [
+    '../lib/vision-toggle-root-hardening.js',
+    '../lib/guide-vision-toggle-highlight.js',
+  ]) {
+    await assert.rejects(
+      access(new URL(path, import.meta.url)),
+      (error) => error?.code === 'ENOENT',
+      `${path} must not exist anymore`,
+    )
   }
-  const settings = {
-    get(namespace) { return namespace === 'vision-router' ? config : undefined },
-    register(namespace) {
-      return {
-        get() { return namespace === 'vision-router' ? config : undefined },
-        watch(callback) { callback(namespace === 'vision-router' ? config : undefined); return () => {} },
-      }
-    },
-  }
-  const ctx = {
-    llm,
-    settings,
-    get(name) { return name === 'llm' ? llm : name === 'settings' ? settings : undefined },
-  }
-  return { ctx, registry }
-}
+})
 
-test('root hardening never mutates foreign structured scripts or inline HTML scripts', () => {
-  // A foreign plugin with an ordinary null-config guard used to lose the
-  // guard when DVR scanned every script row / the entire HTML document.
-  const foreign = [
-    'function foreign(config, hidden) {',
-    "  if (!config || typeof config !== 'object') return hidden",
-    '  return config.value',
-    '}',
-  ].join('\n')
-  const runForeign = (source) => vm.runInNewContext(source + "\nforeign(null, 'safe')", {})
-  assert.equal(runForeign(foreign), 'safe')
+test('retirement: the public entry no longer wires root hardening into the Host boundary', () => {
+  const entrySource = readFileSync(new URL('../src/lib/public-entry.js', import.meta.url), 'utf8')
+  assert.doesNotMatch(entrySource, /vision-toggle-root-hardening/)
+  assert.doesNotMatch(entrySource, /createVisionToggleRootHardening/)
+  assert.doesNotMatch(entrySource, /installClientBoundary/)
+  assert.doesNotMatch(entrySource, /route-ownership/)
+  assert.doesNotMatch(entrySource, /__dshVisionRouterRootHardening/)
+  // The settings-composition chain it used to wrap still composes.
+  assert.match(entrySource, /contextWithVisionRoutingTopologyRefresh\(sessionSourceCtx\)/)
+  assert.match(entrySource, /base\.apply\(runtimeCtx, config, \{ providerTransport: transport \}\)/)
+})
 
-  let injectRows
-  const webCtx = {
-    on(name, handler) {
-      if (name === 'webserver/index-inject') injectRows = handler
-    },
-    effect(callback) { callback() },
-    webServer: {
-      register() { return () => {} },
-      tapIndex() { return () => {} },
-    },
-  }
-  const fakeCtx = { inject(_deps, callback) { callback(webCtx) } }
-  createVisionToggleRootHardening(fakeCtx, {}).installClientBoundary()
-  assert.equal(typeof injectRows, 'function')
+test('retirement: no ownership prelude or endpoint marker ships to the browser', () => {
+  const html = injectClientPresentationBoundary('<html><head></head><body></body></html>')
+  assert.equal(html.includes('__dshVisionRouterRootHardening'), false,
+    'the retired ownership prelude must not be injected')
+  assert.equal(html.includes('data-vision-router-root-ownership'), false)
+  assert.equal(html.includes('/_dsh/vision-router/route-ownership'), false)
+  assert.equal(html.includes('data-vision-router-guide-toggle-highlight'), false,
+    'the retired guide highlight carrier must not be injected')
+})
 
-  const own = `/* data-vision-router-model-visibility */\n${VISION_MODEL_VISIBILITY_PRELUDE}`
-  const rows = [
-    { kind: 'script', placement: 'head', text: foreign },
-    { kind: 'script', placement: 'head', text: own },
+test('retirement: no client carrier re-introduces the retired ownership or highlight surfaces', () => {
+  const boundarySources = [
+    '../src/lib/client-presentation-boundary-main.js',
+    '../src/lib/client-presentation-boundary.js',
+    '../src/lib/public-entry.js',
+    '../src/lib/web/index.js',
+    '../src/lib/web/onboarding.js',
+    '../src/lib/web/model-picker.js',
   ]
-  injectRows(rows)
-  assert.equal(rows[0].text, foreign, 'must not rewrite third-party structured script rows')
-  assert.equal(runForeign(rows[0].text), 'safe')
-  assert.notEqual(rows[1].text, own, 'must still harden DVR-owned structured carriers')
-  assert.match(rows[1].text, /lastRecoverySource/)
-
-  const foreignTag = `<script data-foreign-plugin>${foreign}</script>`
-  const html = `<html><head>${foreignTag}</head><body></body></html>`
-  const after = hardenVisionToggleHtml(html)
-  assert.ok(after.includes(foreignTag), 'must not rewrite unrelated inline HTML scripts')
-  assert.equal(runForeign(foreign), 'safe')
-
-  const ownedHtml = injectVisionModelVisibilityBoundary(html)
-  const hardenedOwned = hardenVisionToggleHtml(ownedHtml)
-  assert.match(hardenedOwned, /lastRecoverySource/,
-    'DVR-owned inline scripts must retain their root hardening')
-})
-
-test('root hardening makes duplicate wrapper adoption unreachable across base and live settings scopes', () => {
-  const config = { wrapperRoute: 'deepseek-vision', chainRoute: 'vision-chain' }
-  const spoof = {
-    providerInfo(route) { return { id: route, name: 'DeepSeek + 自动识图' } },
+  for (const path of boundarySources) {
+    const source = readFileSync(new URL(path, import.meta.url), 'utf8')
+    assert.doesNotMatch(source, /route-ownership/, `${path} must not register the retired endpoint`)
+    assert.doesNotMatch(source, /hardenVisionClientSource|hardenVisionToggleHtml/, `${path} must not rewrite client scripts`)
   }
-  const { ctx } = fakeHost(config, [{ route: 'deepseek-vision', adapter: spoof }])
-  const hardening = createVisionToggleRootHardening(ctx, config)
-
-  assert.equal(hardening.config.wrapperRoute, '')
-  assert.equal(hardening.ctx.get('settings').get('vision-router').wrapperRoute, '')
-  assert.equal(hardening.ctx.settings.register('vision-router').get().wrapperRoute, '')
-  assert.equal(hardening.ctx.llm.listProviders().some((entry) => entry.id === 'deepseek-vision'), false)
-  assert.equal(hardening.ownership.sourceFor('deepseek-vision'), undefined)
-
-  const twin = {
-    providerInfo(route) { return { id: route, name: 'Vendor + 自动识图' } },
-  }
-  const handle = hardening.ctx.llm.registerAdapter(['vendor-vision'], twin)
-  assert.equal(hardening.ownership.sourceFor('vendor-vision'), 'vendor')
-  handle()
-  assert.equal(hardening.ownership.sourceFor('vendor-vision'), undefined)
-})
-
-test('routing projection replays the existing settings reconcile only when a foreign route is released', async () => {
-  const config = { wrapperRoute: 'deepseek-vision', chainRoute: 'vision-chain' }
-  const spoof = {
-    providerInfo(route) { return { id: route, name: 'DeepSeek + 自动识图' } },
-  }
-  const { ctx, registry } = fakeHost(config, [{ route: 'deepseek-vision', adapter: spoof }])
-  const listeners = new Map()
-  ctx.on = (name, listener) => {
-    if (!listeners.has(name)) listeners.set(name, new Set())
-    listeners.get(name).add(listener)
-    return () => listeners.get(name)?.delete(listener)
-  }
-  const emit = (name) => {
-    for (const listener of listeners.get(name) ?? []) listener()
-  }
-
-  const hardening = createVisionToggleRootHardening(ctx, config)
-  const runtimeCtx = contextWithVisionRoutingTopologyRefresh(hardening.ctx)
-  const seen = []
-  runtimeCtx.settings.register('vision-router').watch((value) => seen.push(value.wrapperRoute))
-  assert.deepEqual(seen, [''])
-
-  // An unrelated topology event while the conflict is unchanged must not
-  // replay the settings watcher and cannot create a registration loop.
-  emit('llm/adapters-updated')
-  await Promise.resolve()
-  await Promise.resolve()
-  assert.deepEqual(seen, [''])
-
-  registry.delete('deepseek-vision')
-  emit('llm/adapters-updated')
-  await Promise.resolve()
-  await Promise.resolve()
-  assert.deepEqual(seen, ['', 'deepseek-vision'])
-})
-
-test('root hardening rewrites only the existing #284 seams and removes the official settingsScope hard dependency', () => {
-  let html = '<html><head></head><body></body></html>'
-  html = injectClientPresentationBoundary(html)
-  html = injectVisionModelVisibilityBoundary(html)
-  const hardened = hardenVisionToggleHtml(html)
-
-  assert.match(hardened, /result && result !== loader/)
-  assert.doesNotMatch(hardened, /plugin\.inject = plugin\.inject\.concat\('settingsScope'\)/)
-  assert.match(hardened, /ownership\.sourceFor\(twinProvider\) !== sourceProvider/)
-  assert.match(hardened, /ownership\.sourceFor\(wrapperRoute\) !== VISION_MODE_WRAPPER_SOURCE/)
-  assert.match(hardened, /ownership\.sourceFor\(target\.id\)/)
-  assert.match(hardened, /data-vision-router-root-ownership/)
-  assert.match(hardened, /raw\.status === 'selecting' \|\| raw\.status === 'loading'/)
-})
-
-function scriptsOfInjectedFixture(html) {
-  const scripts = []
-  let cursor = 0
-  while (cursor < html.length) {
-    const open = html.indexOf('<script', cursor)
-    if (open === -1) break
-    const body = html.indexOf('>', open + '<script'.length)
-    const close = body === -1 ? -1 : html.indexOf('</script>', body + 1)
-    assert.notEqual(body, -1, 'generated fixture script tag must have an opening delimiter')
-    assert.notEqual(close, -1, 'generated fixture script tag must have a closing delimiter')
-    scripts.push(html.slice(body + 1, close))
-    cursor = close + '</script>'.length
-  }
-  return scripts
-}
-
-test('root hardening patches a loader returned from create and every later global loader replacement', () => {
-  let registered
-  const returned = { load(spec) { registered = spec; return spec } }
-  const initial = {
-    load(spec) { registered = spec; return spec },
-    create() { return returned },
-  }
-  const window = { __ModuleLoader__: initial, fetch: async () => ({ ok: true, json: async () => ({ revision: 0, routes: [] }) }) }
-  let html = injectVisionModelVisibilityBoundary('<html><head></head></html>')
-  html = hardenVisionToggleHtml(html)
-  const context = {
-    window,
-    Object,
-    Promise,
-    Array,
-    String,
-    Map,
-    Set,
-    WeakMap,
-    Proxy,
-    Reflect,
-    JSON,
-    Date,
-    Number,
-    Error,
-    console,
-  }
-  for (const source of scriptsOfInjectedFixture(html)) vm.runInNewContext(source, context)
-
-  const created = initial.create()
-  assert.equal(created, returned)
-  assert.equal(returned.load.__visionRouterModelVisibility, true)
-
-  const replacement = { load(spec) { registered = spec; return spec } }
-  window.__ModuleLoader__ = replacement
-  assert.equal(replacement.load.__visionRouterModelVisibility, true)
-})
-
-test('resolved Host RemoteResult failures remain failures and populate recovery diagnostics', async () => {
-  const window = { fetch: async () => ({ ok: true, json: async () => ({ revision: 0, routes: [] }) }) }
-  const html = hardenVisionToggleHtml('<html><head></head></html>')
-  const source = scriptsOfInjectedFixture(html).find((script) => script.includes('__dshVisionRouterRootHardening'))
-  assert.ok(source)
-  vm.runInNewContext(source, {
-    window,
-    Object,
-    Promise,
-    Array,
-    String,
-    Map,
-    Set,
-    WeakMap,
-    JSON,
-    Date,
-    Number,
-    Error,
-  })
-  const api = window.__dshVisionRouterRootHardening
-  let shouldFail = true
-  const directory = {
-    select() {
-      return shouldFail
-        ? Promise.resolve({
-            ok: false,
-            error: { code: 'session/writer-held', message: 'Another writer temporarily owns this session.' },
-          })
-        : Promise.resolve({ ok: true, value: undefined })
-    },
-  }
-  const selection = { provider: 'vendor-vision', model: 'm' }
-
-  const rejected = await api.select(directory, selection)
-  assert.equal(rejected.ok, false)
-  assert.match(api.recoveryFor(directory).getSnapshot().message, /session\/writer-held: Another writer/)
-
-  shouldFail = false
-  const accepted = await api.select(directory, selection)
-  assert.equal(accepted.ok, true)
-  assert.equal(api.recoveryFor(directory).getSnapshot(), null)
-})
-
-test('stale selection completions never overwrite the newest recovery state', async () => {
-  const window = { fetch: async () => ({ ok: true, json: async () => ({ revision: 0, routes: [] }) }) }
-  const html = hardenVisionToggleHtml('<html><head></head></html>')
-  const source = scriptsOfInjectedFixture(html).find((script) => script.includes('__dshVisionRouterRootHardening'))
-  assert.ok(source)
-  vm.runInNewContext(source, {
-    window,
-    Object,
-    Promise,
-    Array,
-    String,
-    Map,
-    Set,
-    WeakMap,
-    JSON,
-    Date,
-    Number,
-    Error,
-  })
-  const api = window.__dshVisionRouterRootHardening
-
-  const pending = []
-  const directory = {
-    select(selection) {
-      return new Promise((resolve) => pending.push({ selection, resolve }))
-    },
-  }
-  const old = api.select(directory, { provider: 'p', model: 'on' })
-  const newest = api.select(directory, { provider: 'p', model: 'off' })
-  await Promise.resolve()
-  assert.equal(pending.length, 2)
-
-  pending[1].resolve({ ok: true, value: undefined })
-  await newest
-  assert.equal(api.recoveryFor(directory).getSnapshot(), null)
-
-  pending[0].resolve({ ok: false, error: { code: 'stale', message: 'old failure' } })
-  const oldResult = await old
-  assert.equal(oldResult.ok, false)
-  assert.equal(api.recoveryFor(directory).getSnapshot(), null)
-
-  const pending2 = []
-  const directory2 = {
-    select(selection) {
-      return new Promise((resolve) => pending2.push({ selection, resolve }))
-    },
-  }
-  const oldSuccess = api.select(directory2, { provider: 'p', model: 'on' })
-  const newFailure = api.select(directory2, { provider: 'p', model: 'off' })
-  await Promise.resolve()
-
-  pending2[1].resolve({ ok: false, error: { code: 'latest', message: 'new failure' } })
-  await newFailure
-  assert.match(api.recoveryFor(directory2).getSnapshot().message, /latest: new failure/)
-
-  pending2[0].resolve({ ok: true, value: undefined })
-  await oldSuccess
-  assert.match(api.recoveryFor(directory2).getSnapshot().message, /latest: new failure/)
-})
-
-test('selection transport rejection is recoverable without mutating the Host directory store and identical double-clicks coalesce', async () => {
-  const window = { fetch: async () => ({ ok: true, json: async () => ({ revision: 0, routes: [] }) }) }
-  const html = hardenVisionToggleHtml('<html><head></head></html>')
-  const source = scriptsOfInjectedFixture(html).find((script) => script.includes('__dshVisionRouterRootHardening'))
-  assert.ok(source)
-  vm.runInNewContext(source, {
-    window,
-    Object,
-    Promise,
-    Array,
-    String,
-    Map,
-    Set,
-    WeakMap,
-    JSON,
-    Date,
-    Number,
-    Error,
-  })
-  const api = window.__dshVisionRouterRootHardening
-  let calls = 0
-  let shouldFail = true
-  const directory = {
-    store: { getSnapshot() { return { status: 'selecting', error: null } } },
-    select() {
-      calls += 1
-      return shouldFail ? Promise.reject(new Error('connection reset')) : Promise.resolve()
-    },
-  }
-  const selection = { provider: 'vendor-vision', model: 'm' }
-  const first = api.select(directory, selection)
-  const second = api.select(directory, selection)
-  assert.equal(first, second)
-  await assert.rejects(first, /connection reset/)
-  assert.equal(calls, 1)
-  assert.match(api.recoveryFor(directory).getSnapshot().message, /connection reset/)
-  assert.equal(directory.store.getSnapshot().status, 'selecting')
-
-  shouldFail = false
-  await api.select(directory, selection)
-  assert.equal(calls, 2)
-  assert.equal(api.recoveryFor(directory).getSnapshot(), null)
-})
-
-
-test('issue #684 rejected selection reporter survives current Client source without bound recovery variables', () => {
-  // Real alpha.2 Desktop rejection on Windows Node24 used to reach this exact
-  // source-rewritten function and throw ReferenceError: recovery is not defined.
-  // Other unit fixtures only exercised the independent recovery store API.
-  const html = hardenVisionToggleHtml(
-    injectClientPresentationBoundary('<html><head></head><body></body></html>'),
-  )
-  const client = scriptsOfInjectedFixture(html)
-    .find((source) => source.includes('function announceRejectedSelection()'))
-  assert.ok(client, 'must exercise the actual composed Client script')
-  const start = client.indexOf('        function announceRejectedSelection() {')
-  const end = client.indexOf('\n\n        var button = React.createElement', start)
-  assert.ok(start >= 0 && end > start, 'failed selection reporter must have a parseable boundary')
-  const functionSource = client.slice(start, end)
-  assert.match(functionSource, /typeof recovery === 'undefined'/)
-  assert.doesNotMatch(functionSource, /recoveryError\s*;/)
-
-  const directory = { store: { getSnapshot: () => ({ error: null }) } }
-  const captured = []
-  const translations = (key, params) =>
-    key === 'failedUnknown' ? 'Unknown failure'
-      : key === 'failed' ? 'Switch failed: ' + params.message : key
-  function run({ hostError, recoveredError, inheritedRecovery } = {}) {
-    const store = { getSnapshot: () => ({ error: hostError ?? null }) }
-    const window = {
-      __dshVisionRouterRootHardening: recoveredError === undefined ? undefined : {
-        recoveryFor(candidate) {
-          assert.equal(candidate, directory, 'recovery must belong to the same Host ModelDirectory')
-          return { getSnapshot: () => new Error(recoveredError) }
-        },
-      },
-    }
-    const context = {
-      store, window, directory, Number,
-      t: translations,
-      setToast(update) { captured.push(update(null)) },
-      ...(inheritedRecovery ? {
-        recovery: { getSnapshot: () => new Error(inheritedRecovery) },
-      } : {}),
-    }
-    assert.doesNotThrow(() => vm.runInNewContext(functionSource + '\nannounceRejectedSelection()', context))
-    return captured.at(-1).text
-  }
-
-  assert.match(run({ recoveredError: 'session/model-unavailable: injected Host rejection' }),
-    /session\/model-unavailable: injected Host rejection/)
-  assert.match(run({ hostError: 'session/model-unavailable: real Host error', recoveredError: 'stale' }),
-    /session\/model-unavailable: real Host error/)
-  assert.match(run({}), /Unknown failure/)
-  assert.match(run({ inheritedRecovery: 'existing older Host recovery' }),
-    /existing older Host recovery/)
-})
-
-
-test('issue #684 recovery wrapper returns stable snapshots through Host rejection and catalog refresh', () => {
-  // Evaluate the actual generated wrapStore function, not an independently
-  // reimplemented mock. The original bug created a new Object.assign() every
-  // time React useSyncExternalStore called getSnapshot while loading/selecting.
-  const source = hardenVisionClientSource(VISION_MODEL_VISIBILITY_PRELUDE)
-  const start = source.indexOf('  function wrapStore(store, settings, recovery) {')
-  const end = source.indexOf('\n  function wrapDirectory(', start)
-  assert.ok(start >= 0 && end > start, 'must extract the production transformed wrapStore')
-  const wrapStore = vm.runInNewContext(source.slice(start, end) + '\nwrapStore', {
-    currentVisionConfig: (settings) => settings.getSnapshot().value,
-    configKey: (config) => JSON.stringify(config),
-    // Force a fresh projected object for each real input change, exactly as
-    // projectVisionModeDirectoryState is allowed to do.
-    projectVisionModeDirectoryState: (state, config) => ({ ...state, settings: config }),
-    Object, String,
-  })
-
-  let raw = { status: 'loading', error: null, current: { provider: 'vision' } }
-  let fault = new Error('session/model-unavailable: original rejection')
-  let config = { wrappedProviders: ['vision'] }
-  const origin = {
-    getSnapshot: () => raw,
-    subscribe: () => () => {},
-  }
-  const recovery = {
-    getSnapshot: () => fault,
-    subscribe: () => () => {},
-  }
-  const settings = {
-    getSnapshot: () => ({ value: config }),
-    subscribe: () => () => {},
-  }
-  const wrapped = wrapStore(origin, settings, recovery)
-  const first = wrapped.getSnapshot()
-  assert.equal(first.status, 'error')
-  assert.match(first.error, /session\/model-unavailable/)
-  assert.equal(raw.status, 'loading', 'must never mutate Host-owned directory state')
-  for (let i = 0; i < 25; i++) {
-    assert.equal(wrapped.getSnapshot(), first, 'no snapshot identity change without a real input change')
-  }
-
-  raw = { ...raw, status: 'selecting' }
-  const second = wrapped.getSnapshot()
-  assert.notEqual(second, first)
-  assert.equal(second, wrapped.getSnapshot())
-  assert.equal(second.status, 'error')
-
-  fault = new Error('session/writer-held: newer rejection')
-  const third = wrapped.getSnapshot()
-  assert.notEqual(third, second, 'new recovery failure must invalidate the cached synthetic snapshot')
-  assert.match(third.error, /session\/writer-held/)
-  assert.equal(third, wrapped.getSnapshot())
-
-  // Catalog/reconnect changes can yield a new Host snapshot with equal data:
-  // that real update must be reflected exactly once, not on every read.
-  raw = { ...raw }
-  const fourth = wrapped.getSnapshot()
-  assert.notEqual(fourth, third)
-  assert.equal(fourth, wrapped.getSnapshot())
-
-  config = { wrappedProviders: ['vision'], autoWrapProviders: true }
-  const fifth = wrapped.getSnapshot()
-  assert.notEqual(fifth, fourth)
-  assert.equal(fifth, wrapped.getSnapshot())
-
-  fault = null
-  const cleared = wrapped.getSnapshot()
-  assert.notEqual(cleared, fifth)
-  assert.equal(cleared.status, 'selecting')
-  assert.equal(cleared, wrapped.getSnapshot())
-  raw = { ...raw, status: 'ready' }
-  const ready = wrapped.getSnapshot()
-  assert.equal(ready.status, 'ready')
-  assert.equal(ready, wrapped.getSnapshot())
-})
-
-test('Windows CRLF client source still receives the exact root ownership hardening', () => {
-  let html = '<html><head></head><body></body></html>'
-  html = injectClientPresentationBoundary(html)
-  html = injectVisionModelVisibilityBoundary(html)
-  const crlf = html.replaceAll('\n', '\r\n')
-  const hardened = hardenVisionToggleHtml(crlf)
-  assert.match(hardened, /ownership\.sourceFor\(twinProvider\) !== sourceProvider/)
-  assert.match(hardened, /ownership\.sourceFor\(wrapperRoute\) !== VISION_MODE_WRAPPER_SOURCE/)
-  assert.match(hardened, /ownership\.sourceFor\(target\.id\)/)
 })

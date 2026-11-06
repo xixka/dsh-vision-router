@@ -1,13 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { readFile, access } from 'node:fs/promises'
 import { Config, SETTINGS_CONTRACT_REVISION } from '../entry.js'
 import { Config as CoreConfig } from '../index.js'
-import {
-  GUIDE_VISION_TOGGLE_HIGHLIGHT_PRELUDE,
-  injectGuideVisionToggleHighlight,
-  unionGuideRects,
-} from '../lib/guide-vision-toggle-highlight.js'
+import { injectClientPresentationBoundary } from '../lib/client-presentation-boundary.js'
 
 const bundlePatch = new URL('../cordis.patch.yml', import.meta.url)
 
@@ -90,23 +86,24 @@ test('public plugin config leaves the whole-turn vision budget unlimited by defa
   assert.equal(Config({ visionTurnBudgetMs: 180000 }).visionTurnBudgetMs, 180000)
 })
 
-test('walkthrough step 1 combines the Vision toggle and model selector into one spotlight', () => {
-  assert.deepEqual(
-    unionGuideRects(
-      { x: 100, y: 440, left: 100, top: 440, right: 220, bottom: 500, width: 120, height: 60 },
-      { x: 236, y: 430, left: 236, top: 430, right: 760, bottom: 510, width: 524, height: 80 },
-    ),
-    { x: 100, y: 430, left: 100, top: 430, right: 760, bottom: 510, width: 660, height: 80 },
+test('walkthrough step 1 highlights only the chat model selector after the toggle retirement', async () => {
+  // The guide highlight prelude that combined the retired Vision toggle and
+  // the model selector into one spotlight is gone (plan §5.2). The walkthrough
+  // spotlight geometry now has exactly one first-party owner: the settings
+  // walkthrough inside the client bundle.
+  await assert.rejects(
+    access(new URL('../lib/guide-vision-toggle-highlight.js', import.meta.url)),
+    (error) => error?.code === 'ENOENT',
+    'the retired guide highlight module must not exist',
   )
-  assert.match(GUIDE_VISION_TOGGLE_HIGHLIGHT_PRELUDE, /data-vr-step="step1"/)
-  assert.match(GUIDE_VISION_TOGGLE_HIGHLIGHT_PRELUDE, /data-vision-router-mode-toggle/)
-  assert.match(GUIDE_VISION_TOGGLE_HIGHLIGHT_PRELUDE, /vr-guide-spot-hole/)
-  assert.match(GUIDE_VISION_TOGGLE_HIGHLIGHT_PRELUDE, /vr-guide-spot-ring/)
+  const html = injectClientPresentationBoundary('<html><head></head><body></body></html>')
+  assert.equal(html.includes('data-vision-router-guide-toggle-highlight'), false)
+  assert.equal(html.includes('data-vision-router-mode-toggle'), false)
 
-  const html = '<html><head></head><body></body></html>'
-  const once = injectGuideVisionToggleHighlight(html)
-  assert.equal(injectGuideVisionToggleHighlight(once), once)
-  assert.equal((once.match(/data-vision-router-guide-toggle-highlight/g) ?? []).length, 1)
+  const client = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+  assert.match(client, /vr-guide-spot-hole/)
+  assert.match(client, /vr-guide-spot-ring/)
+  assert.match(client, /GUIDE_SELECTOR_TARGETS/)
 })
 
 test('entry contract always exposes the local remote-settings permission and handshake', () => {

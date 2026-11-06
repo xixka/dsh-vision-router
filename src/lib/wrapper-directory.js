@@ -1,12 +1,15 @@
-// DSH rc.7 split the live adapter registry from the Models settings directory.
-// A wrapper registered only through llm.registerAdapter() is callable and shows
-// up in llm.models, but Settings -> Models intentionally hides live routes that
-// have no settings address. Vision Router's main `deepseek-vision` route is a
-// derived DeepSeek view, not a generic alias of an arbitrary text provider, so
-// publish it against the official DeepSeek settings address only.
+// P5 (plan §5.1-5): the Models-directory alias runtime is RETIRED. The
+// historical wrapper route is never registered by the zero-Provider build, so
+// no directory entry is published, replaced, or synchronized anymore. What
+// remains is the READ-ONLY historical source reader: completed messages that
+// name the retired wrapper route must stay readable, exportable, compactable
+// and replayable, so historical session surfaces still resolve the identity
+// the route always had (route name, display label, and the official DeepSeek
+// settings address it aliased). Nothing here writes Host state.
 
 const DEFAULT_WRAPPER_ROUTE = 'deepseek-vision'
 const DEFAULT_TEXT_PROVIDER = 'deepseek-official'
+const HISTORICAL_WRAPPER_DISPLAY_NAME = 'DeepSeek + 自动识图'
 
 function nonEmptyString(value, fallback) {
   return typeof value === 'string' && value !== '' ? value : fallback
@@ -24,19 +27,24 @@ function resolvedVisionRouterConfig(ctx, baseConfig) {
 }
 
 /**
- * Resolve the rc.7 Models-directory entry for the main auto-vision wrapper.
- * The wrapper deliberately reuses official DeepSeek's settings namespace and
- * path. A stale/advanced `textProvider` value must never make a row labelled
- * "DeepSeek + 自动识图" edit or imply a Kimi/OpenRouter/relay provider.
- * Returns undefined until both the wrapper adapter and official DeepSeek's
- * configurable-provider entry are visible, preserving older DSH behavior as
- * a no-op fallback.
+ * READ-ONLY historical source reader (plan §5.1-5). Resolves the historical
+ * wrapper-directory identity for labeling/history surfaces: the configured
+ * wrapper route name, the label the row always carried, and the official
+ * DeepSeek settings address it aliased. The wrapper adapter is never live in
+ * the zero-Provider build, so — unlike the retired runtime — the reader does
+ * NOT require live topology. A stale/advanced `textProvider` must never
+ * relabel the row: the historical wrapper always aliased official DeepSeek.
+ * Returns undefined when the Host lacks the read-only directory API or the
+ * official settings address cannot be resolved (fail-closed: never invent an
+ * address, never publish anything).
+ * @param {object} ctx - Host context (llm/settings read access only).
+ * @param {object} [baseConfig] - composition fallback for the settings read.
+ * @returns {object|undefined} the historical directory entry, for reads only.
  */
 export function resolveWrapperDirectoryEntry(ctx, baseConfig = {}) {
   const llm = ctx && ctx.llm
   if (
     !llm ||
-    typeof llm.listProviders !== 'function' ||
     typeof llm.listConfigurableProviders !== 'function'
   ) {
     return undefined
@@ -44,160 +52,36 @@ export function resolveWrapperDirectoryEntry(ctx, baseConfig = {}) {
 
   const config = resolvedVisionRouterConfig(ctx, baseConfig)
   const wrapperRoute = nonEmptyString(config.wrapperRoute, DEFAULT_WRAPPER_ROUTE)
-  const sourceProvider = DEFAULT_TEXT_PROVIDER
 
-  let liveProviders
   let configurableProviders
   try {
-    liveProviders = llm.listProviders()
     configurableProviders = llm.listConfigurableProviders()
   } catch {
     return undefined
   }
-  if (!Array.isArray(liveProviders) || !Array.isArray(configurableProviders)) return undefined
+  if (!Array.isArray(configurableProviders)) return undefined
 
-  const wrapper = liveProviders.find((entry) => entry && entry.id === wrapperRoute)
-  if (!wrapper) return undefined
-
-  const source = configurableProviders.find((entry) => entry && entry.provider === sourceProvider)
+  const source = configurableProviders.find(
+    (entry) => entry && entry.provider === DEFAULT_TEXT_PROVIDER,
+  )
   if (!source || typeof source.settingsNs !== 'string' || source.settingsNs === '') return undefined
 
   return {
     provider: wrapperRoute,
-    displayName:
-      typeof wrapper.name === 'string' && wrapper.name !== ''
-        ? wrapper.name
-        : 'DeepSeek + 自动识图',
+    displayName: HISTORICAL_WRAPPER_DISPLAY_NAME,
     settingsNs: source.settingsNs,
     settingsPath: Array.isArray(source.settingsPath) ? [...source.settingsPath] : [],
   }
 }
 
 /**
- * Keep the wrapper's configurable-provider alias synchronized with live
- * settings/topology. registerConfigurableProviders() itself emits
- * llm/adapters-updated, so the small re-entrancy guard is required.
+ * P5 retirement (plan §5.1-5): runtime directory ownership is retired. The
+ * historical composition call site keeps its signature, but the installer
+ * publishes nothing, subscribes to nothing, and owns nothing — on every Host
+ * shape, including runtimes without any directory API. The returned disposer
+ * is a no-op so the caller's lifecycle wiring stays valid.
+ * @returns {() => undefined} inert disposer.
  */
-export function installWrapperDirectoryAlias(ctx, baseConfig = {}, logger = ctx && ctx.logger) {
-  const llm = ctx && ctx.llm
-  if (
-    !llm ||
-    typeof llm.registerConfigurableProviders !== 'function' ||
-    typeof llm.listConfigurableProviders !== 'function'
-  ) {
-    return () => undefined
-  }
-
-  let handle
-  let ownedProvider
-  let heldKey
-  let syncing = false
-  let disposed = false
-  let lastWarnMessage = ''
-
-  // Repeated llm/adapters-updated emissions with a persistent error must not
-  // spam the log with the identical warning on every emission.
-  const warn = (label, detail) => {
-    const message = detail === undefined ? label : `${label} ${detail}`
-    if (message === lastWarnMessage) return
-    lastWarnMessage = message
-    logger?.warn?.(message)
-  }
-
-  const sync = () => {
-    if (disposed || syncing) return
-    const next = resolveWrapperDirectoryEntry(ctx, baseConfig)
-    const nextEntries = next ? [next] : []
-    const nextKey = JSON.stringify(nextEntries)
-
-    // A future Harness/plugin version may already own this exact directory
-    // route. Never fight it; if we currently own an older alias, withdraw ours.
-    if (next && next.provider !== ownedProvider) {
-      let directory = []
-      try {
-        directory = llm.listConfigurableProviders()
-      } catch {
-        directory = []
-      }
-      if (Array.isArray(directory) && directory.some((entry) => entry && entry.provider === next.provider)) {
-        if (handle && ownedProvider !== undefined) {
-          syncing = true
-          try {
-            handle.replace([])
-            ownedProvider = undefined
-            // The withdrawal already published the empty set; record that key
-            // so the next no-op sync does not issue a redundant replace.
-            heldKey = JSON.stringify([])
-          } catch (error) {
-            warn(
-              'vision-router: failed to withdraw stale Models-directory alias:',
-              error && error.message ? error.message : String(error),
-            )
-          } finally {
-            syncing = false
-          }
-        }
-        return
-      }
-    }
-
-    if (handle && heldKey === nextKey) return
-    if (!handle && !next) return
-
-    syncing = true
-    try {
-      if (handle) {
-        handle.replace(nextEntries)
-      } else {
-        handle = llm.registerConfigurableProviders(nextEntries)
-      }
-      ownedProvider = next ? next.provider : undefined
-      heldKey = nextKey
-    } catch (error) {
-      // Directory publication affects Settings -> Models discoverability only;
-      // never turn a healthy wrapper adapter into a plugin startup failure.
-      warn(
-        'vision-router: Models-directory alias sync failed:',
-        error && error.message ? error.message : String(error),
-      )
-    } finally {
-      syncing = false
-    }
-  }
-
-  // DSH registerConfigurableProviders() has been caller-fiber-owned since the
-  // supported 0.1.5 floor. This effect owns only DVR's local generation state;
-  // do not double-own or double-dispose the Host registration handle.
-  if (typeof ctx.effect === 'function') {
-    try {
-      ctx.effect(
-        () => () => {
-          disposed = true
-          handle = undefined
-          ownedProvider = undefined
-          heldKey = undefined
-        },
-        'vision-router: models-directory alias local state',
-      )
-    } catch {
-      disposed = true
-      return sync
-    }
-  }
-
-  // Establish the generation owner before publishing a directory alias or
-  // subscribing to events that could later republish it.
-  sync()
-  if (disposed) return sync
-  if (typeof ctx.on === 'function') {
-    ctx.on('llm/adapters-updated', sync)
-    ctx.on('settings/updated', (ns) => {
-      if (String(ns) === 'vision-router') sync()
-    })
-    ctx.on('settings/document-updated', (ns) => {
-      if (String(ns) === 'vision-router') sync()
-    })
-  }
-
-  return sync
+export function installWrapperDirectoryAlias() {
+  return () => undefined
 }

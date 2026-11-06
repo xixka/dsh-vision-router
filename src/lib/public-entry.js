@@ -1,6 +1,5 @@
 import './abort-signal-compat.js'
 import * as base from '../entry.js'
-import { createVisionToggleRootHardening } from './vision-toggle-root-hardening.js'
 import { contextWithVisionRoutingTopologyRefresh } from './vision-routing-topology-refresh.js'
 import { createVisionProviderTransport } from './vision-provider-transport.js'
 import { installLegacyGlobalProxyBoundary } from './legacy-global-proxy-boundary.js'
@@ -23,8 +22,11 @@ function liveVisionConfig(ctx, fallback) {
 }
 
 /**
- * Public package entry: keep the mature entry.js implementation intact and
- * place root hardening at its outermost registration/browser boundary.
+ * Public package entry: keep the mature entry.js implementation intact.
+ *
+ * The retired toggle's root hardening layer (plan §5.2) no longer wraps this
+ * boundary: Vision mode is controlled exclusively by the /vision command, and
+ * the Host keeps sole authority over the model directory and its adapters.
  *
  * Router-owned provider transport is installed before runtime composition.
  * After base.apply installs the mature Host/DVR fetch wrappers, the legacy proxy
@@ -60,11 +62,10 @@ export function apply(ctx, config = {}) {
   // DVR-authored contexts at the final hook-publication seam using the Session's
   // own durable header version, never a DSH package-version guess.
   const sessionSourceCtx = installVisionRouterMessageSourceBoundary(settingsCtx)
-  const hardening = createVisionToggleRootHardening(sessionSourceCtx, config)
-  const runtimeCtx = contextWithVisionRoutingTopologyRefresh(hardening.ctx)
+  const runtimeCtx = contextWithVisionRoutingTopologyRefresh(sessionSourceCtx)
   const transport = createVisionProviderTransport({
-    ctx: hardening.ctx,
-    config: () => liveVisionConfig(hardening.ctx, config),
+    ctx: sessionSourceCtx,
+    config: () => liveVisionConfig(sessionSourceCtx, config),
   })
   let transportReleased = false
   let transportReleasePromise
@@ -80,9 +81,8 @@ export function apply(ctx, config = {}) {
       () => releaseTransport,
       'vision-router: provider transport',
     )
-    const result = base.apply(runtimeCtx, hardening.config, { providerTransport: transport })
-    installLegacyGlobalProxyBoundary(runtimeCtx, hardening.config)
-    hardening.installClientBoundary()
+    const result = base.apply(runtimeCtx, config, { providerTransport: transport })
+    installLegacyGlobalProxyBoundary(runtimeCtx, config)
     return result
   } catch (error) {
     void releaseTransport().catch(() => {})

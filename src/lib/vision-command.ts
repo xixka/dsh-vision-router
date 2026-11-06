@@ -226,6 +226,9 @@ async function runVisionCommand(
       enabled: intent.kind === 'on',
       origin: 'command',
       signal: invocation.signal,
+      // Off also revokes a not-yet-executed route lease through the same
+      // live Agent (plan §3.1); on ignores it.
+      agent: invocation.agent,
     })
     return { kind: 'success', text: visionModeText(intent.kind, outcome.persistence) }
   }

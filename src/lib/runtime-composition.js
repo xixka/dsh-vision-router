@@ -5,6 +5,7 @@
 // implementation details. Keep the mature installers below in their historical
 // order so entry.js can remain the thin public schema/export boundary.
 
+import { z } from 'zod'
 import { installVisionRouterFileLogging } from './file-logger.js'
 import { contextWithDelegatedReplay } from './replay-delegation.js'
 import { contextWithReplayEnvelopeV2Compat } from './replay-envelope-v2-compat.js'
@@ -119,6 +120,213 @@ function listConfiguredVisionBackends(config) {
     /* /vision status copy must survive any config shape */
   }
   return names
+}
+
+// Durable route-lease sidecar (plan §4.3, t5 handoff). The routing coordinator
+// consumes a synchronous leaseStore — save/clear fire-and-forget, load
+// synchronous — so this store follows the Session policy sidecar's
+// optional-capability and lifecycle pattern with one difference forced by that
+// contract: the storage domain opens lazily and asynchronously, durable writes
+// drain in the background, and load() serves the write-through cache plus the
+// opened table's synchronous get. Until the open completes, loads miss and the
+// lease keeps its documented in-process degradation.
+const routeLeaseDomainSpec = Object.freeze({
+  name: 'vision_router_route_lease',
+  version: 1,
+  layout: 'per-record',
+  invalidRecords: 'backup-and-skip',
+  tables: Object.freeze({
+    leases: Object.freeze({
+      // Mirrors the coordinator's lease contract in agent-prestep-model-routing
+      // (LEASE_VERSION 1 / LEASE_SOURCE 'dvr-auto' plus the complete original
+      // selection it saves). A strict row means a future lease format must bump
+      // the domain version instead of silently widening this schema.
+      valueSchema: z.object({
+        version: z.literal(1),
+        source: z.literal('dvr-auto'),
+        origin: z.object({
+          provider: z.string().min(1),
+          model: z.string().min(1),
+          reasoningEffort: z.string().min(1).optional(),
+        }).strict(),
+        target: z.object({
+          provider: z.string().min(1),
+          model: z.string().min(1),
+        }).strict(),
+        sessionRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+        pluginGeneration: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+        token: z.string().min(1),
+        executed: z.boolean().optional(),
+      }).strict(),
+    }),
+  }),
+})
+
+function createDurableRouteLeaseStore(ctx, logger) {
+  const cache = new Map()
+  const closedDomains = new WeakSet()
+  // Writes admitted while the domain is still opening drain as soon as the
+  // handle exists, so a lease saved in the open window still reaches durable
+  // storage instead of silently staying process-local.
+  const pendingWrites = []
+  let handle
+  let opening = false
+  let durableDisabled = false
+  let lifecycleClosed = false
+  let warned = false
+
+  const warnDegraded = (message) => {
+    if (warned) return
+    warned = true
+    try {
+      logger?.warn?.(
+        'vision-router: route lease persistence unavailable; using process-local leases: %s',
+        message,
+      )
+    } catch {}
+  }
+
+  const facilityOf = () => {
+    // storageDomain is an optional Host capability; Context#get is the
+    // non-owning probe, the same seam as the Session policy sidecar.
+    try {
+      const facility = ctx?.get?.('storageDomain')
+      return facility && typeof facility.open === 'function' ? facility : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  const closeDomainOnce = async (domain) => {
+    if (!domain || typeof domain.close !== 'function') return
+    if (closedDomains.has(domain)) return
+    closedDomains.add(domain)
+    try {
+      await domain.close()
+    } catch (error) {
+      warnDegraded(error?.message ?? String(error))
+    }
+  }
+
+  const drainPendingWrites = (target) => {
+    while (pendingWrites.length > 0) {
+      const write = pendingWrites.shift()
+      if (write.op === 'put') {
+        target.put(write.id, write.lease).catch((error) => warnDegraded(error?.message ?? String(error)))
+      } else {
+        target.delete(write.id).catch(() => {
+          /* a stale durable lease is cleaned up by the next save or load */
+        })
+      }
+    }
+  }
+
+  const enqueueWrite = (write) => {
+    if (lifecycleClosed || durableDisabled) return
+    pendingWrites.push(write)
+    if (handle !== undefined) drainPendingWrites(handle)
+    else ensureOpen()
+  }
+
+  const ensureOpen = () => {
+    if (lifecycleClosed || durableDisabled || handle !== undefined || opening) return
+    const facility = facilityOf()
+    if (facility === undefined) {
+      durableDisabled = true
+      pendingWrites.length = 0
+      warnDegraded('storageDomain capability not mounted')
+      return
+    }
+    opening = true
+    facility.open(routeLeaseDomainSpec).then(
+      (domain) => {
+        opening = false
+        if (lifecycleClosed || durableDisabled) {
+          pendingWrites.length = 0
+          void closeDomainOnce(domain)
+          return
+        }
+        const table = typeof domain?.table === 'function' ? domain.table('leases') : undefined
+        if (
+          table === undefined
+          || typeof table.get !== 'function'
+          || typeof table.put !== 'function'
+          || typeof table.delete !== 'function'
+        ) {
+          durableDisabled = true
+          pendingWrites.length = 0
+          warnDegraded('route lease domain table unusable')
+          return
+        }
+        handle = {
+          get: (key) => table.get(key),
+          put: (key, value) => table.put(key, value),
+          delete: (key) => table.delete(key),
+          close: () => domain.close(),
+        }
+        drainPendingWrites(handle)
+      },
+      (error) => {
+        opening = false
+        durableDisabled = true
+        pendingWrites.length = 0
+        warnDegraded(error?.message ?? String(error))
+      },
+    )
+  }
+
+  try {
+    if (typeof ctx?.effect === 'function') {
+      ctx.effect(
+        () => {
+          ensureOpen()
+          return async () => {
+            // No new lease I/O is admitted after lifecycle close; the handle
+            // is retired so a late open cannot leak a same-name unit.
+            lifecycleClosed = true
+            pendingWrites.length = 0
+            const closing = handle
+            handle = undefined
+            if (closing !== undefined) await closing.close().catch(() => {})
+          }
+        },
+        'vision-router: route lease domain lifecycle',
+      )
+    } else {
+      durableDisabled = true
+      warnDegraded('Context effect unavailable')
+    }
+  } catch (error) {
+    durableDisabled = true
+    warnDegraded(error?.message ?? String(error))
+  }
+
+  return {
+    save(id, lease) {
+      if (typeof id !== 'string' || id === '' || lease === null || typeof lease !== 'object') return
+      cache.set(id, lease)
+      enqueueWrite({ op: 'put', id, lease })
+    },
+    clear(id) {
+      if (typeof id !== 'string' || id === '') return
+      cache.delete(id)
+      enqueueWrite({ op: 'delete', id })
+    },
+    load(id) {
+      if (typeof id !== 'string' || id === '') return undefined
+      ensureOpen()
+      const hit = cache.get(id)
+      if (hit !== undefined) return hit
+      const target = handle
+      if (target === undefined) return undefined
+      try {
+        return target.get(id)
+      } catch (error) {
+        warnDegraded(error?.message ?? String(error))
+        return undefined
+      }
+    },
+  }
 }
 
 function installHostAndSecurityBoundaries(ctx, config, core, providerTransport) {
@@ -275,6 +483,22 @@ function createRuntimeOwners(host, core) {
     { sessionVisionPolicyStore },
   )
 
+  // P5 wiring (plan §4.3, t5/t8 handoff): the durable route-lease sidecar and
+  // the per-Session policy revision feed the routing coordinator through the
+  // core.apply runtime object. The coordinator's lease record stays in-process
+  // until its consumer wires these seams; the store itself already persists
+  // every save/clear and serves recovered leases across restart and hot reset.
+  const routeLeaseStore = createDurableRouteLeaseStore(legacyCoreCompat.ctx, logging.logger)
+  const routeLeaseSessionRevision = (session) => {
+    try {
+      const id = typeof session?.id === 'string' && session.id !== '' ? session.id : undefined
+      if (id === undefined) return undefined
+      return sessionVisionPolicyStore.get(id)?.updateRevision
+    } catch {
+      return undefined
+    }
+  }
+
   // P1 (plan.md §3): one UI-less service layer owns Session Vision mode
   // changes and image-task submissions over the same durable policy store;
   // the /vision command is its Commands-facing surface. Compositions without
@@ -296,6 +520,8 @@ function createRuntimeOwners(host, core) {
     sessionVisionPolicyStore,
     sessionVisionRuntime,
     visionSessionService,
+    routeLeaseStore,
+    routeLeaseSessionRevision,
   }
 }
 
@@ -454,7 +680,14 @@ function applyMatureCoreBridge(host, owners, routing, execution, core, runtime) 
     runtimeConfig,
     runtimeI18nCoreScope,
   } = host
-  const { coreVisionSurfaceRuntime, sessionVisionModeCompat, sessionVisionRuntime } = owners
+  const {
+    coreVisionSurfaceRuntime,
+    routeLeaseSessionRevision,
+    routeLeaseStore,
+    sessionVisionModeCompat,
+    sessionVisionRuntime,
+    visionSessionService,
+  } = owners
   const { breakerShadowHealth, sessionEventTailReader, sessionTurnResolver } = routing
   const { coreRequestAuthorityCtx } = execution
   try {
@@ -509,6 +742,13 @@ function applyMatureCoreBridge(host, owners, routing, execution, core, runtime) 
             sessionEventTailReader,
             hostOwnsOfficialDeepSeek,
             providerTransport: runtime?.providerTransport,
+            // P5 (plan §4.3/§4.5, t5/t8 handoff): composition-owned durable
+            // route-lease sidecar and per-Session policy revision, plus the
+            // shared service instance so the /vision off lease-revoke bridge
+            // can receive the coordinator's revokers.
+            leaseStore: routeLeaseStore,
+            sessionRevision: routeLeaseSessionRevision,
+            visionSessionService,
           },
         ),
       ),
