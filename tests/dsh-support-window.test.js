@@ -24,7 +24,7 @@ test('P3 support policy contains only public stable support semantics', () => {
 test('forward-admission evidence and dynamic canaries stay separate from stable-floor fields', () => {
   assert.deepEqual(DSH_VERIFICATION_EVIDENCE, {
     exactStable: '0.1.5-rc.3',
-    exactPreview: '0.2.0-rc.2',
+    exactPreview: '0.2.1-rc.5',
     stableCanaryDistTag: 'latest',
     nextCanaryDistTag: 'next',
     previewCanaryDistTag: 'alpha',
@@ -53,7 +53,7 @@ test('Doctor text separates public support policy from verification evidence', (
   assert.ok(lines.slice(0, evidenceAt).some((line) => line.includes('minimum supported Host: 0.1.5')))
   assert.ok(lines.slice(0, evidenceAt).some((line) => line.includes('current stable Host: 0.1.5-rc.3')))
   assert.equal(lines.slice(0, evidenceAt).some((line) => /alpha|canary/i.test(line)), false)
-  assert.ok(lines.slice(evidenceAt).some((line) => line.includes('exact supported 0.2.x boundary: 0.2.0-rc.2')))
+  assert.ok(lines.slice(evidenceAt).some((line) => line.includes('exact supported 0.2.x boundary: 0.2.1-rc.5')))
   assert.ok(lines.slice(evidenceAt).some((line) => line.includes('npm dist-tag latest')))
   assert.ok(lines.slice(evidenceAt).some((line) => line.includes('npm dist-tag next')))
   assert.ok(lines.slice(evidenceAt).some((line) => line.includes('npm dist-tag alpha')))
@@ -76,7 +76,7 @@ test('public READMEs state stable support policy and delegate forward-boundary e
     assert.match(source, /0\.2\.0-rc\.2/)
     assert.match(source, /docs\/architecture\/dsh-support-window\.md/)
   }
-  assert.match(supportDoc, /Exact supported 0\.2\.x boundary \| `0\.2\.0-rc\.2`/)
+  assert.match(supportDoc, /Exact supported 0\.2\.x boundary \| `0\.2\.1-rc\.5`/)
 })
 
 

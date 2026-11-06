@@ -6,7 +6,7 @@ export const DSH_SUPPORT_WINDOW = Object.freeze({
 
 export const DSH_VERIFICATION_EVIDENCE = Object.freeze({
   exactStable: '0.1.5-rc.3',
-  exactPreview: '0.2.0-rc.2',
+  exactPreview: '0.2.1-rc.5',
   stableCanaryDistTag: 'latest',
   nextCanaryDistTag: 'next',
   previewCanaryDistTag: 'alpha',

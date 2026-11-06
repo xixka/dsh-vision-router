@@ -10,13 +10,13 @@ The public support policy contains only released Host semantics. Preview/canary 
 |---|---|---|---|
 | `2.2.x` | `0.1.0-rc.8` | `0.1.5-rc.3` | historical 2.2 development baseline |
 | `2.3.x` | **DSH `0.1.5` train** | `0.1.5-rc.3` | historical 2.3 baseline |
-| `3.0.x` | **DSH `0.1.5` train** | `0.1.5-rc.3` | **exact `0.2.0-rc.2`** |
+| `3.0.x` | **DSH `0.1.5` train** | `0.1.5-rc.3` | **exact `0.2.1-rc.5`** |
 
 DVR `2.2.x` keeps `0.1.0-rc.8` as its historical public floor.
 
 DVR `2.3.0` deliberately resets the public minimum to the **DSH `0.1.5` train**. The earliest admitted release in that train is `0.1.5-rc.1`; current stable evidence is `0.1.5-rc.3`. DVR 2.3 no longer publishes a jagged list of `0.1.0` / `0.1.1` / `0.1.3` / `0.1.7` exceptions.
 
-Ordinary DVR 2.3 development is pinned to **exact DSH `0.2.0-rc.2`** so `pnpm install && pnpm test` exercises the latest fully verified Host/Desktop generation rather than an obsolete compatibility floor. This exact development pin is evidence policy, not a reason to turn runtime behavior into version-string checks.
+Ordinary DVR 3.x development is pinned to **exact DSH `0.2.1-rc.5`** so `pnpm install && pnpm test` exercises the latest fully verified Host/Desktop generation rather than an obsolete compatibility floor. This exact development pin is evidence policy, not a reason to turn runtime behavior into version-string checks.
 
 Runtime branching remains capability-based rather than version-string-driven.
 
@@ -24,7 +24,7 @@ Runtime branching remains capability-based rather than version-string-driven.
 
 DVR 2.2.x peer-admits the DSH `0.2.x` train from the verified rc.1 boundary (`>=0.2.0-rc.1 <0.3.0-0`) without raising its historical `0.1.0-rc.8` minimum Host floor.
 
-DVR 2.3 uses exact `0.2.0-rc.2` as its ordinary development Host while keeping the public minimum at the `0.1.5` train. Peer admission is intentionally train-shaped: `>=0.1.5-rc.1 <0.2.0-0` for the continuous supported 0.1.x line from 0.1.5, plus `>=0.2.0-rc.2 <0.3.0-0` for the 0.2.x train from the verified rc.2 boundary. Initial forward admission was backed by public pre-0.2.0 master `21638c56315ae6a2b552d6091945d3144c9af32e`. Exact release evidence has now advanced to immutable `dsh-v0.2.0-rc.2` commit `639ed015397290b3745d163aafe02ffee4aa3f84`, published on 2026-09-29. Required gates cover three-OS source contracts, real Host + Chromium, Settings mount/save/reload/readback, mixed attachments, bundle recomposition, Windows Node 22/24 Desktop authentication, the Node 24 multi-plugin isolation adversary, and Host-owned Sharp resolution.
+DVR 3.x uses exact `0.2.1-rc.5` as its ordinary development Host while keeping the public minimum at the `0.1.5` train. Peer admission is intentionally train-shaped: `>=0.1.5-rc.1 <0.2.0-0` for the continuous supported 0.1.x line from 0.1.5, plus `>=0.2.0-rc.2 <0.3.0-0` for the 0.2.x train from the verified rc.2 boundary. Initial forward admission was backed by public pre-0.2.0 master `21638c56315ae6a2b552d6091945d3144c9af32e`. Exact release evidence has now advanced to immutable `dsh-v0.2.1-rc.5` commit `b830ec950faba0a46dda564be3e2d854afed94f1`, published on 2026-10-29. Required gates cover three-OS source contracts, real Host + Chromium, Settings mount/save/reload/readback, mixed attachments, bundle recomposition, Windows Node 22/24 Desktop authentication, the Node 24 multi-plugin isolation adversary, and Host-owned Sharp resolution.
 
 The final immutable upstream `0.2.0` stable tag and signed official Desktop installer remain release-time revalidation targets. The verified `0.2.0-rc.2` boundary is already part of DVR 2.3's peer-admitted supported 0.2.x train; it does not raise the public minimum above the DSH 0.1.5 train.
 
@@ -35,7 +35,7 @@ Exact evidence answers which admitted Host points have current CI proof; moving 
 | Evidence role | DSH source | Meaning |
 |---|---|---|
 | Exact stable evidence | `0.1.5-rc.3` | Required Host/wire and real Host + Chromium coverage for the current stable release. |
-| Exact supported 0.2.x boundary | `0.2.0-rc.2` (`next/rc`) | Required Host/wire/lifecycle/browser/Desktop evidence for the peer-admitted 0.2.x train; it does not raise the 0.1.5 minimum floor. |
+| Exact supported 0.2.x boundary | `0.2.1-rc.5` (`next/rc`) | Required Host/wire/lifecycle/browser/Desktop evidence for the peer-admitted 0.2.x train; it does not raise the 0.1.5 minimum floor. |
 | Stable drift canary | npm dist-tag `latest` | Scheduled, dynamically resolved surveillance. A failure starts compatibility investigation; it does not rewrite support policy. |
 | Next/rc drift canary | npm dist-tag `next` | Scheduled, dynamically resolved surveillance for the rc channel. A failure does not rewrite support policy. |
 | Alpha/pre-release drift canary | npm dist-tag `alpha` | Scheduled, dynamically resolved surveillance for the alpha channel. A failure does not rewrite support policy. |
