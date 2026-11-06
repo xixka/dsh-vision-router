@@ -51,7 +51,7 @@ function visionToolSurfaceEnabled(ctx, config, authority) {
 
 function visionModeDisabledError(name) {
   const error = new Error(
-    `${name}: Vision mode is off for this Session; enable the composer Vision control before using Vision Router tools`,
+    `${name}: Vision mode is off for this Session; run /vision on before using Vision Router tools`,
   )
   error.code = 'VISION_MODE_DISABLED'
   return error
@@ -495,9 +495,17 @@ export function installSessionVisionModeBoundary(ctx, config = {}, runtime = {})
         liveConfig(ctx, config),
         { route: event.data },
       )
-      void sessionVisionPolicyStore
-        .set(id, userSessionVisionPolicy(authority.enabled))
-        .catch(() => {})
+      // Prefer the monotonic update seam so every user selection advances the
+      // per-Session revision; stores predating that seam keep the plain write.
+      const writePolicy = () =>
+        typeof sessionVisionPolicyStore.apply === 'function'
+          ? sessionVisionPolicyStore.apply(id, {
+              enabled: authority.enabled,
+              source: 'user',
+              origin: 'model-selection',
+            })
+          : sessionVisionPolicyStore.set(id, userSessionVisionPolicy(authority.enabled))
+      void writePolicy().catch(() => {})
     })
   } catch {
     // Minimum Hosts may not expose every lifecycle event. Prompt assembly and

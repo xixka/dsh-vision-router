@@ -7,9 +7,14 @@ import type {
 
 import {
   SESSION_VISION_POLICY_REVISION,
+  normalizeSessionVisionPolicyUpdateRequest,
+  nextSessionVisionPolicy,
   parseSessionVisionPolicy,
   type SessionVisionPolicy,
+  type SessionVisionPolicyPersistence,
   type SessionVisionPolicyStore,
+  type SessionVisionPolicyUpdateOutcome,
+  type SessionVisionPolicyUpdateRequest,
 } from './session-vision-policy.js'
 
 /**
@@ -26,12 +31,16 @@ const policySchema = z.discriminatedUnion('source', [
     revision: z.literal(SESSION_VISION_POLICY_REVISION),
     enabled: z.boolean(),
     source: z.literal('user'),
+    updateRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    updateOrigin: z.string().trim().min(1).optional(),
   }).strict(),
   z.object({
     revision: z.literal(SESSION_VISION_POLICY_REVISION),
     enabled: z.boolean(),
     source: z.literal('delegation'),
     inheritedFrom: z.string().trim().min(1),
+    updateRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    updateOrigin: z.string().trim().min(1).optional(),
   }).strict(),
 ])
 
@@ -269,6 +278,46 @@ export function createSessionVisionPolicyRuntimeStore(
     return current
   }
 
+  const hydrateIntoCache = async (
+    sessionId: string,
+  ): Promise<Readonly<SessionVisionPolicy> | undefined> => {
+    const key = normalizedSessionId(sessionId)
+    const existing = cache.get(key)
+    if (existing !== undefined) return existing
+    const token = {}
+    hydrationTokens.set(key, token)
+    try {
+      const handle = await table()
+      if (hydrationTokens.get(key) !== token) return cache.get(key)
+      if (handle === undefined) return undefined
+      const policy = parseSessionVisionPolicy(handle.get(key))
+      if (hydrationTokens.get(key) !== token) return cache.get(key)
+      if (policy !== undefined) cache.set(key, policy)
+      return policy
+    } catch (error) {
+      await failDurabilityAndRetire(error)
+      return undefined
+    } finally {
+      if (hydrationTokens.get(key) === token) hydrationTokens.delete(key)
+    }
+  }
+
+  const applyTails = new Map<string, Promise<SessionVisionPolicyUpdateOutcome>>()
+
+  /**
+   * Durable write outcome for one apply, evaluated after its mutation tail.
+   * Every degraded reason names why this write must not be reported as saved.
+   */
+  const runtimePersistence = (): SessionVisionPolicyPersistence => {
+    if (durableDisabled) return { kind: 'degraded', reason: 'session-policy-storage-failed' }
+    if (!lifecycleBound) return { kind: 'degraded', reason: 'session-policy-lifecycle-not-bound' }
+    if (lifecycleClosed) return { kind: 'degraded', reason: 'session-policy-lifecycle-closed' }
+    if (storageDomainOf(ctx) === undefined) {
+      return { kind: 'degraded', reason: 'storage-domain-unavailable' }
+    }
+    return { kind: 'persisted' }
+  }
+
   return {
     get durable() {
       return lifecycleBound
@@ -282,25 +331,7 @@ export function createSessionVisionPolicyRuntimeStore(
     },
 
     async hydrate(sessionId) {
-      const key = normalizedSessionId(sessionId)
-      const existing = cache.get(key)
-      if (existing !== undefined) return existing
-      const token = {}
-      hydrationTokens.set(key, token)
-      try {
-        const handle = await table()
-        if (hydrationTokens.get(key) !== token) return cache.get(key)
-        if (handle === undefined) return undefined
-        const policy = parseSessionVisionPolicy(handle.get(key))
-        if (hydrationTokens.get(key) !== token) return cache.get(key)
-        if (policy !== undefined) cache.set(key, policy)
-        return policy
-      } catch (error) {
-        await failDurabilityAndRetire(error)
-        return undefined
-      } finally {
-        if (hydrationTokens.get(key) === token) hydrationTokens.delete(key)
-      }
+      return await hydrateIntoCache(sessionId)
     },
 
     release(sessionId) {
@@ -349,6 +380,47 @@ export function createSessionVisionPolicyRuntimeStore(
           await failDurabilityAndRetire(error)
         }
       })
+    },
+
+    async apply(sessionId: string, request: SessionVisionPolicyUpdateRequest) {
+      const key = normalizedSessionId(sessionId)
+      const normalized = normalizeSessionVisionPolicyUpdateRequest(request)
+      const previous = applyTails.get(key) ?? Promise.resolve()
+      const run = async (): Promise<SessionVisionPolicyUpdateOutcome> => {
+        // Read-modify-publish inside the per-Session tail keeps apply
+        // monotonic against other apply calls even when a plain set()
+        // publishes between tails; a cold Session hydrates its durable row
+        // first so the counter never restarts over a durable predecessor.
+        const existing = cache.get(key) ?? await hydrateIntoCache(key)
+        const policy = nextSessionVisionPolicy(existing, normalized)
+        hydrationTokens.delete(key)
+        cache.set(key, policy)
+        await enqueueMutation(key, async () => {
+          try {
+            // Same admission rule as set(): a mutation admitted before
+            // lifecycle close must finish its durable I/O.
+            const handle = await table(true)
+            if (handle !== undefined) await handle.put(key, policy)
+          } catch (error) {
+            await failDurabilityAndRetire(error)
+          }
+        })
+        return Object.freeze({
+          policy,
+          updateRevision: policy.updateRevision,
+          updateOrigin: policy.updateOrigin,
+          persistence: runtimePersistence(),
+        })
+      }
+      // Chain on rejection too: one failed apply must not poison every later
+      // update on the same Session.
+      const current = previous.then(run, run)
+      applyTails.set(key, current)
+      void current.then(
+        () => { if (applyTails.get(key) === current) applyTails.delete(key) },
+        () => { if (applyTails.get(key) === current) applyTails.delete(key) },
+      )
+      return await current
     },
   }
 }

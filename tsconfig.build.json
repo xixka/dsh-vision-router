@@ -35,6 +35,8 @@
     "src/lib/session-vision-delegation.ts",
     "src/lib/session-vision-delegation-boundary.ts",
     "src/lib/session-vision-state.ts",
+    "src/lib/vision-session-service.ts",
+    "src/lib/vision-command.ts",
     "src/lib/session-query-readers.ts",
     "src/lib/session-event-history-compat.ts",
     "src/lib/session-vision-attachment-index.ts",

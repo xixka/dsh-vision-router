@@ -19,6 +19,8 @@ import { installLegacyCoreVisionPolicyBridge } from './legacy-core-vision-policy
 import { installSessionVisionModeBoundary } from './session-vision-mode-boundary.js'
 import { resolveSessionVisionModeAuthority } from './session-vision-mode-authority.js'
 import { createSessionVisionPolicyRuntimeStore } from './session-vision-policy-domain.js'
+import { createVisionSessionService } from './vision-session-service.js'
+import { installVisionCommand } from './vision-command.js'
 import { installSessionVisionDelegationBoundary } from './session-vision-delegation-boundary.js'
 import { installPiAiBridgeWireCompat } from './pi-ai-bridge-wire-compat.js'
 import { installLiveModelDiscovery } from './live-model-discovery.js'
@@ -96,6 +98,27 @@ function legacyCoreVisionSettings(ctx, fallback) {
   // only Core's retired prose-parsing switch through its explicit policy
   // surface; never impersonate Settings or replace the real plugin config.
   return { ...current, autoActivateOnImage: false }
+}
+
+// Sanitized backend names for /vision status: configured kinds and
+// user-chosen provider labels only, never endpoints, credentials, or paths.
+function listConfiguredVisionBackends(config) {
+  const names = []
+  try {
+    if (!config || typeof config !== 'object') return names
+    if (config.freeFallback !== false) names.push('builtin-free-fallback')
+    if (config.localOllama?.enabled === true) names.push('local-ollama')
+    if (config.localLmStudio?.enabled === true) names.push('local-lm-studio')
+    const providers = config.httpProviders
+    if (providers && typeof providers === 'object' && !Array.isArray(providers)) {
+      for (const name of Object.keys(providers)) {
+        if (typeof name === 'string' && name.trim() !== '') names.push(name.trim())
+      }
+    }
+  } catch {
+    /* /vision status copy must survive any config shape */
+  }
+  return names
 }
 
 function installHostAndSecurityBoundaries(ctx, config, core, providerTransport) {
@@ -252,12 +275,27 @@ function createRuntimeOwners(host, core) {
     { sessionVisionPolicyStore },
   )
 
+  // P1 (plan.md §3): one UI-less service layer owns Session Vision mode
+  // changes and image-task submissions over the same durable policy store;
+  // the /vision command is its Commands-facing surface. Compositions without
+  // the Commands registry keep the service usable with no slash command.
+  const visionSessionService = createVisionSessionService({
+    store: sessionVisionPolicyStore,
+    logger: logging.logger,
+    listBackends: () => listConfiguredVisionBackends(runtimeConfig),
+  })
+  installVisionCommand(legacyCoreCompat.ctx, {
+    service: visionSessionService,
+    logger: logging.logger,
+  })
+
   return {
     coreVisionSurfaceRuntime,
     nativeImageCompat,
     sessionVisionModeCompat,
     sessionVisionPolicyStore,
     sessionVisionRuntime,
+    visionSessionService,
   }
 }
 
