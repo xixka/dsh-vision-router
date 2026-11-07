@@ -73,7 +73,18 @@ jobs:
           pnpm build:check
       - name: Install DSH dependencies
         working-directory: dsh-021-rc5
+        env:
+          CI: 'true'
+          LEFTHOOK: '0'
         run: pnpm install --frozen-lockfile
+      - name: Build exact Host runtime
+        # `dsh web` boots the CLI through tsx, but package exports resolve to
+        # each workspace package's built lib/ output; without this build the
+        # typert loader cannot find lib/typert.host.js. Built without any
+        # shared Actions cache: newly executed upstream code never receives a
+        # path to poison caches trusted by future default-branch jobs.
+        working-directory: dsh-021-rc5
+        run: pnpm run build
       - name: Coordinator state machine unit tests
         working-directory: dvr
         run: node --test tests/plugin-hot-upgrade-coordinator.test.js
