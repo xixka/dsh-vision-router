@@ -48,6 +48,7 @@ import {
   toRealPath,
   chromiumCandidates,
   callOpenAICompatible,
+  callLocalBackend,
   cacheKeyFor,
   adapterAvailable,
   httpProvidersOf,
@@ -2305,10 +2306,12 @@ test('auto-wrap discovers nothing: the machine is retired and legacy intent stay
   assert.equal(adapters.has('minimax-vision'), false)
   assert.equal(adapters.size, 1, 'only the Host-registered adapter exists')
   // The native image-capable model stays attested as-is for the pre-step
-  // router: the Host route itself is the vision route now.
+  // router: the Host route itself is the vision route now (the mock's
+  // resolveModelInfo delegates to the adapter's resolveModel, so the name is
+  // the model id — exactly what the Host published).
   assert.deepEqual(
     await ctx.llm.resolveModelInfo('minimax', 'minimax-vision-native'),
-    { provider: 'minimax', id: 'minimax-vision-native', name: 'MiniMax Vision', inputModalities: ['text', 'image'] },
+    { provider: 'minimax', id: 'minimax-vision-native', name: 'minimax-vision-native', inputModalities: ['text', 'image'] },
   )
 })
 
@@ -2380,12 +2383,13 @@ test('wrappedProviders never registers an image-capable twin route for any inten
   assert.equal(adapters.size, 1, 'only the Host-registered adapter exists')
   assert.deepEqual(directories, [])
   // The source route keeps its Host-owned identity untouched — the exact
-  // adapter instance and metadata that the Host registered survive apply().
+  // adapter instance and metadata that the Host registered survive apply()
+  // (the mock resolves through the adapter, so name === model id).
   const registration = ctx.llm.registration('opencode-go')
   assert.equal(registration.adapter, thirdParty)
   assert.deepEqual(
     await ctx.llm.resolveModelInfo('opencode-go', 'deepseek-v4-flash'),
-    { provider: 'opencode-go', id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', inputModalities: ['text'], context: { contextWindow: 100000 } },
+    { provider: 'opencode-go', id: 'deepseek-v4-flash', name: 'deepseek-v4-flash', inputModalities: ['text'], context: { contextWindow: 100000 } },
   )
 })
 
@@ -2539,8 +2543,9 @@ test('issue #446 adapter instance preservation now guards the SOURCE registratio
   const fire = captured.on.get('llm/adapters-updated')
   assert.ok(fire)
   // Metadata refresh on the Host side keeps the Host-owned adapter instance
-  // and its presentation name untouched — the retired twin reconciler must
-  // not snapshot or rewrite anything.
+  // untouched while the registration mirrors the LIVE source presentation —
+  // the retired twin reconciler must not snapshot or rewrite anything, but
+  // the Host's own replace() legitimately re-reads providerInfo.
   displayName = '天翼云模型服务'
   sourceHandle.replace(['ctyun'])
   fire()
@@ -2549,7 +2554,7 @@ test('issue #446 adapter instance preservation now guards the SOURCE registratio
   assert.deepEqual(directories, [])
   const registration = ctx.llm.registration('ctyun')
   assert.strictEqual(registration.adapter, source)
-  assert.deepEqual(registration.provider, { id: 'ctyun', name: '天翼云' })
+  assert.deepEqual(registration.provider, { id: 'ctyun', name: '天翼云模型服务' })
 })
 
 test('issue #446 withdraw/restore now covers only Host-owned registrations', () => {
