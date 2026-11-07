@@ -10,7 +10,6 @@ import assert from 'node:assert/strict'
 
 const SHIMS = [
   { name: 'benchmark-panel', module: '../lib/web/benchmark-panel.js', installers: ['installVisionBenchmarkPanel'] },
-  { name: 'onboarding', module: '../lib/web/onboarding.js', installers: ['installVisionOnboarding'] },
   { name: 'routing-section', module: '../lib/web/routing-section.js', installers: ['installVisionRoutingSection'] },
   { name: 'settings-controller', module: '../lib/web/settings-controller.js', installers: ['installVisionSettingsController'] },
   {
@@ -19,6 +18,26 @@ const SHIMS = [
     installers: ['installVisionModelPickerPresentation', 'installVisionModelPickerControls', 'installVisionModelPicker'],
   },
 ]
+
+// After the composer Vision toggle retirement (plan §5.2) the onboarding
+// installer is intentionally inert — /vision command-first teaching lives in
+// the settings dictionaries, so the shim deliberately registers no browser
+// prelude and injects no guide-highlight script (see src/lib/web/onboarding.js).
+// Pin that retirement contract instead of the delegation seam it no longer uses.
+test('onboarding installer is intentionally inert after the toggle retirement', async () => {
+  const module = await import('../lib/web/onboarding.js')
+  assert.equal(typeof module.installVisionOnboarding, 'function', 'installVisionOnboarding must stay exported')
+
+  const { ctx, registrations } = recordingContext()
+  assert.equal(module.installVisionOnboarding(ctx), ctx, 'installVisionOnboarding must return the ctx it was given')
+  assert.equal(registrations.length, 0, 'installVisionOnboarding must not register any carrier surface')
+
+  const bare = { on() {}, effect() {} }
+  assert.equal(module.installVisionOnboarding(bare), bare)
+  for (const value of [{}, null, undefined, 42, 'x']) {
+    assert.doesNotThrow(() => module.installVisionOnboarding(value), `installVisionOnboarding(${String(value)}) must not throw`)
+  }
+})
 
 function recordingContext() {
   const registrations = []
