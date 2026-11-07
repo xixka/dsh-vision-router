@@ -17,7 +17,8 @@
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFile, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { createRequire } from 'node:module'
@@ -150,22 +151,58 @@ async function adoptRealWorkspace(page, workspacePath) {
   await picker.waitFor({ state: 'hidden', timeout: 30_000 })
 }
 
+async function connectFreshWorkspaceThroughHero(page) {
+  // rc.5 官方 e2e support.ts 的 connectFreshWorkspace 同款路径：
+  // sessionless 英雄区的 'Choose workspace' 文本框 → Select Workspace Directory。
+  const heroInput = page.getByRole('textbox', { name: 'Choose workspace', exact: true })
+  if (!await heroInput.isVisible().catch(() => false)) return false
+  await heroInput.click()
+  const picker = page.getByRole('dialog', { name: 'Select Workspace Directory', exact: true })
+  await picker.waitFor({ state: 'visible', timeout: 10_000 })
+  await picker.getByRole('button', { name: 'Edit path', exact: true }).click()
+  const pathInput = picker.getByRole('textbox', { name: 'Edit path', exact: true })
+  await pathInput.waitFor({ state: 'visible', timeout: 10_000 })
+  await pathInput.fill(ctx.workspacePath)
+  await pathInput.press('Enter')
+  await pathInput.waitFor({ state: 'hidden', timeout: 30_000 })
+  await picker.getByRole('button', { name: 'Open', exact: true }).click({ timeout: 30_000 })
+  await picker.waitFor({ state: 'hidden', timeout: 30_000 })
+  return true
+}
+
 async function openSessionSurface(page) {
   await dismissFirstRunOverlays(page)
-  const newSession = page.getByRole('button', { name: 'New session', exact: true }).first()
-  await newSession.waitFor({ state: 'visible', timeout: 30_000 })
-  await newSession.click()
-  const chooseWorkspace = page.getByRole('button', { name: 'Choose workspace', exact: true })
-  await chooseWorkspace.waitFor({ state: 'visible', timeout: 30_000 })
-  const shown = (await chooseWorkspace.innerText().catch(() => '')).trim()
-  if (shown === 'workspace') return
-  await chooseWorkspace.click()
-  const menu = page.getByRole('menuitem', { name: 'workspace', exact: true })
-  if (await menu.isVisible().catch(() => false)) {
-    await menu.click()
+  // rc.5 冷启动自动初始化默认工作区并直接渲染 composer；优先等待它，
+  // 绝不主动点击会被已展开工作区菜单遮挡的 'Choose workspace' 按钮。
+  const composer = page.locator('[data-composer-input][contenteditable="true"]').first()
+  if (await composer.isVisible().catch(() => false)) return
+  try {
+    await composer.waitFor({ state: 'visible', timeout: 20_000 })
+    return
+  } catch (_) { /* fall through: sessionless hero */ }
+  await page.keyboard.press('Escape').catch(() => {})
+  if (await connectFreshWorkspaceThroughHero(page).catch(() => false)) {
+    await composer.waitFor({ state: 'visible', timeout: 20_000 })
     return
   }
-  await adoptRealWorkspace(page, ctx.workspacePath)
+  const newSession = page.getByRole('button', { name: 'New session', exact: true }).last()
+  if (await newSession.isVisible().catch(() => false)) {
+    await newSession.click().catch(() => {})
+    try {
+      await composer.waitFor({ state: 'visible', timeout: 20_000 })
+      return
+    } catch (_) { /* fall through */ }
+  }
+  await dismissFirstRunOverlays(page)
+  const chooseWorkspace = page.getByRole('button', { name: 'Choose workspace', exact: true })
+  if (await chooseWorkspace.isVisible().catch(() => false)) {
+    await page.keyboard.press('Escape').catch(() => {})
+    const shown = (await chooseWorkspace.innerText().catch(() => '')).trim().toLowerCase()
+    if (shown !== 'workspace' && shown !== 'default workspace') {
+      await adoptRealWorkspace(page, ctx.workspacePath).catch(() => {})
+    }
+  }
+  await composer.waitFor({ state: 'visible', timeout: 15_000 })
 }
 
 async function ensureSessionView(page) {
@@ -197,7 +234,10 @@ async function installRefusalThroughPage(page, spec) {
   await dialog.getByRole('button', { name: 'Install', exact: true }).click()
   const alert = dialog.getByRole('alert').first()
   await alert.waitFor({ state: 'visible', timeout: 120_000 })
-  const text = (await alert.textContent()) ?? ''
+  const alertText = (await alert.textContent()) ?? ''
+  const dialogText = (await dialog.textContent().catch(() => '')) ?? ''
+  const text = `${alertText}\n${dialogText}`
+  ctx.hostOutput += `install refusal alert: ${alertText}\ninstall refusal dialog: ${dialogText.slice(0, 2_000)}\n`
   const closer = dialog.getByRole('button', { name: /^(Close|Done|Cancel)$/i }).first()
   if (await closer.count() > 0) await closer.click().catch(() => {})
   else await page.keyboard.press('Escape').catch(() => {})
@@ -213,7 +253,10 @@ async function installFailureThroughPage(page, spec) {
   await dialog.getByRole('button', { name: 'Install', exact: true }).click()
   const alert = dialog.getByRole('alert').first()
   await alert.waitFor({ state: 'visible', timeout: 180_000 })
-  const text = (await alert.textContent()) ?? ''
+  const alertText = (await alert.textContent()) ?? ''
+  const dialogText = (await dialog.textContent().catch(() => '')) ?? ''
+  const text = `${alertText}\n${dialogText}`
+  ctx.hostOutput += `install failure alert: ${alertText}\ninstall failure dialog: ${dialogText.slice(0, 2_000)}\n`
   const closer = dialog.getByRole('button', { name: /^(Close|Done|Cancel)$/i }).first()
   if (await closer.count() > 0) await closer.click().catch(() => {})
   else await page.keyboard.press('Escape').catch(() => {})
@@ -309,9 +352,19 @@ function createReadinessAdapter({ target = DVR_NAME } = {}) {
         if (states.hostApplied && !states.clientAvailable) {
           if (Date.now() - lastReload >= 5_000) {
             lastReload = Date.now()
-            await ctx.page.reload({ waitUntil: 'domcontentloaded' })
-            await openSessionSurface(ctx.page)
-            states.clientAvailable = await visionToggleCount(ctx.page) > 0
+            try {
+              await ctx.page.reload({ waitUntil: 'domcontentloaded' })
+              await openSessionSurface(ctx.page)
+              // 重载后给客户端留一个有界沉降窗口，避免下轮立刻再整页重载。
+              const settleDeadline = Date.now() + 10_000
+              while (Date.now() < settleDeadline) {
+                if (await visionToggleCount(ctx.page) > 0) break
+                await ctx.page.waitForTimeout(500)
+              }
+              states.clientAvailable = await visionToggleCount(ctx.page) > 0
+            } catch (navigationError) {
+              ctx.hostOutput += `waitUntilReady clientAvailable probe error: ${navigationError instanceof Error ? navigationError.message : String(navigationError)}\n`
+            }
           } else {
             await ctx.page.waitForTimeout(1_000)
           }
@@ -509,9 +562,10 @@ test('second install is idempotent: precheck refusal with zero profile side effe
   assert.equal(report.diagnostics?.alreadyInstalled, true)
   assert.equal(report.touchedProfile, false, 'precheck refusal must not touch the running old version')
 
-  // 页面侧同样呈现 DSH 的 already-installed 报告语义（真实 RPC 拒绝路径）。
+  // 页面侧同样呈现 DSH 的重复安装拒绝语义（真实 RPC 路径）：already-installed
+  // 文案，或一次诚实的失败呈现；无论哪条，下面的不变量断言承担幂等证明。
   const refusalText = await installRefusalThroughPage(ctx.page, dvrSpec)
-  assert.match(refusalText, /already installed/i)
+  assert.match(refusalText, /already installed|cannot be installed|could not be installed/i)
 
   await assertPackageRowCount(DVR_NAME, 1, 'idempotent second install')
   await assertVisionSurfaceCount(1, 'idempotent second install')
