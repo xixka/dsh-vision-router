@@ -5,6 +5,8 @@ import { readFile } from 'node:fs/promises'
 import {
   DSH_SUPPORT_WINDOW,
   DSH_VERIFICATION_EVIDENCE,
+  HOT_INSTALL_NODE_MINIMUM,
+  HOT_INSTALL_SUPPORT_MATRIX,
   formatDshSupportWindowLines,
   supportWindowUpgradeAdvice,
 } from '../lib/dsh-support-window.js'
@@ -30,6 +32,49 @@ test('forward-admission evidence and dynamic canaries stay separate from stable-
     previewCanaryDistTag: 'alpha',
   })
   assert.equal(Object.isFrozen(DSH_VERIFICATION_EVIDENCE), true)
+})
+
+test('hot-install support matrix states exactly the plan §6.2 outcomes without promising hot effects', () => {
+  assert.deepEqual(Object.keys(HOT_INSTALL_SUPPORT_MATRIX).sort(), [
+    'desktopElectron',
+    'externalCliFirstInstall',
+    'externalCliOverwriteUpgrade',
+    'webInAppFirstInstall',
+  ])
+  assert.equal(Object.isFrozen(HOT_INSTALL_SUPPORT_MATRIX), true)
+  for (const cell of Object.values(HOT_INSTALL_SUPPORT_MATRIX)) {
+    assert.equal(Object.isFrozen(cell), true)
+    assert.equal(typeof cell.completionEvidence, 'string')
+  }
+
+  const web = HOT_INSTALL_SUPPORT_MATRIX.webInAppFirstInstall
+  assert.equal(web.supported, true)
+  assert.equal(web.requiresReadinessGate, false)
+  assert.match(web.completionEvidence, /application='applied'/)
+
+  const cli = HOT_INSTALL_SUPPORT_MATRIX.externalCliFirstInstall
+  assert.equal(cli.supported, true)
+  assert.equal(cli.requiresReadinessGate, true)
+  assert.match(cli.completionEvidence, /readiness check/i)
+  assert.match(cli.completionEvidence, /never the CLI exit code/i)
+
+  const overwrite = HOT_INSTALL_SUPPORT_MATRIX.externalCliOverwriteUpgrade
+  assert.equal(overwrite.supported, false)
+  assert.equal(overwrite.hotEffective, false)
+  assert.match(overwrite.completionEvidence, /not hot-effective/i)
+
+  const desktop = HOT_INSTALL_SUPPORT_MATRIX.desktopElectron
+  assert.equal(desktop.supported, false)
+  assert.equal(desktop.hotInstallable, false)
+  assert.match(desktop.completionEvidence, /not hot-installable/i)
+})
+
+test('hot-install Node floor stays stricter than, and separate from, the ordinary install floor', async () => {
+  assert.equal(HOT_INSTALL_NODE_MINIMUM, 24)
+  const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
+  // engines stays the ordinary-install floor: hot-install capability must
+  // never narrow which Node versions can install DVR at all.
+  assert.equal(pkg.engines.node, '^22.19.0 || >=24.0.0')
 })
 
 test('Doctor advice is capability-based against the active support floor', () => {
