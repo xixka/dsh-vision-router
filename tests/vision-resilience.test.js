@@ -868,9 +868,9 @@ test('Test 9: a tripped 401 provider recovers once the credential changes', asyn
   assert.match(second, /修好后的回答/)
 })
 
-// ── Test 10: wrapper/twin parity ───────────────────────────────────────────
+// ── Test 10: native delegation parity (retired twin edition) ───────────────
 
-test('Test 10: a wrapped provider twin delegates with the same request config as the source', async () => {
+test('Test 10: a wrapped provider keeps Host-owned delegation and a read-only plugin', async () => {
   const delegations = []
   const mock = mockVisionCtx({
     channelProfiles: {
@@ -882,7 +882,8 @@ test('Test 10: a wrapped provider twin delegates with the same request config as
     },
   })
   // Replace the pass-through with a recording source adapter (the user's
-  // configured pi-ai channel) BEFORE apply: the twin must delegate to it.
+  // configured pi-ai channel): the retired twin must NOT register anything,
+  // and the Host adapter keeps serving every turn itself.
   const source = {
     providerInfo: (p) => ({ id: p, name: 'Qwen Token Plan CN' }),
     providerRetryPolicy: () => undefined,
@@ -909,16 +910,19 @@ test('Test 10: a wrapped provider twin delegates with the same request config as
   mock.setSeamConfig(config)
   apply(mock.ctx, config)
 
-  // The twin must exist and mirror the source catalog with image input.
-  const twin = mock.adapters.get('qwen-token-plan-cn-vision')
-  assert.ok(twin, 'expected the qwen-token-plan-cn-vision twin route')
-  const listed = await twin.listModels('qwen-token-plan-cn-vision')
-  assert.deepEqual(listed.map((m) => m.id), ['qwen3.6-flash', 'qwen3.6-plus'])
-  for (const model of listed) assert.deepEqual(model.inputModalities, ['text', 'image'])
+  // The retired twin machinery never publishes a route: the Host registry
+  // holds exactly the adapters the Host itself registered.
+  await assert.throws(
+    () => mock.ctx.llm.registration('qwen-token-plan-cn-vision'),
+    /no adapter registered/,
+    'the retired twin route must not exist',
+  )
+  assert.equal(mock.adapters.size, 1)
 
-  // A text turn through the twin delegates to the SOURCE provider byte-for-byte.
-  for await (const _chunk of twin.stream({
-    provider: 'qwen-token-plan-cn-vision',
+  // A direct Host-route turn still delegates to the SOURCE adapter untouched
+  // (provider and model pass through 1:1 — no plugin-owned rewrite layer).
+  for await (const _chunk of mock.ctx.llm.stream({
+    provider: 'qwen-token-plan-cn',
     model: 'qwen3.6-flash',
     messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
   })) {
@@ -928,30 +932,13 @@ test('Test 10: a wrapped provider twin delegates with the same request config as
   assert.equal(delegations[0].provider, 'qwen-token-plan-cn')
   assert.equal(delegations[0].model, 'qwen3.6-flash')
 
-  // An image turn is rewritten for the text-only source instead of leaking
-  // the image block, and still goes to the source provider.
-  for await (const _chunk of twin.stream({
-    provider: 'qwen-token-plan-cn-vision',
-    model: 'qwen3.6-flash',
-    messages: [
-      {
-        role: 'user',
-        content: [
-          { type: 'image', attachment: { attachmentId: IMG_ID, name: 'p.png' } },
-          { type: 'text', text: '这是谁' },
-        ],
-      },
-    ],
-  })) {
-    /* drain */
-  }
-  assert.equal(delegations.length, 2)
-  assert.equal(delegations[1].provider, 'qwen-token-plan-cn')
-  assert.equal(delegations[1].messages[0].content.filter((b) => b.type === 'image').length, 0)
-  // The rewritten marker still carries the no-retry guidance for the agent.
-  const marker = delegations[1].messages[0].content[0].text
-  assert.ok(marker.includes('vision_ocr 只用于读取图中文字'), marker)
-  assert.ok(marker.includes('不要改问法重复调用'), marker)
+  // An image turn on the text-only-declared route must NOT be rewritten by
+  // any plugin layer either: the walk/projection is the only converter, and
+  // it never leaks image blocks through the Host route (fail-closed routing
+  // keeps the chat model; the marker-based rewrite belongs to the projection
+  // contract covered by vision-image-projection.test.js).
+  assert.deepEqual(source.listModels.length > 0, true)
+  assert.equal(delegations.length, 1)
 })
 
 
@@ -1019,6 +1006,8 @@ test('issue #791: empty HTTP success is classified and falls through to second H
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const baseURL = `http://127.0.0.1:${server.address().port}/v1`
   try {
+    // P5: `vision-http/...` rows are direct-backend entries — the walk runs
+    // the whole fallback across the provider transport, never the llm registry.
     const mock = await applyAndMount(visionConfig({
       freeFallback: false,
       cache: true,
@@ -1029,6 +1018,11 @@ test('issue #791: empty HTTP success is classified and falls through to second H
         { name: 'second', baseURL, model: 'vision-good', apiKeyEnv: '' },
       ],
     }))
+    await assert.throws(
+      () => mock.ctx.llm.registration('vision-http'),
+      /no adapter registered/,
+      'vision-http rows stay direct-backend (no Host provider)',
+    )
     const result = await runDescribe(mock, {}, 114)
     assert.equal(result, 'HTTP_FALLBACK_OK')
     assert.deepEqual(wire, ['vision-empty', 'vision-good'])
@@ -1040,9 +1034,8 @@ test('issue #791: empty HTTP success is classified and falls through to second H
 })
 
 
-test('issue #791: whole-turn vision chain skips empty model output and uses the next route', async () => {
+test('issue #791: the tool walk skips empty model output and uses the next route', async () => {
   const mock = await applyAndMount(visionConfig({
-    routing: true,
     freeFallback: false,
     visionTaskTimeoutMs: 3000,
     providers: [
@@ -1055,72 +1048,59 @@ test('issue #791: whole-turn vision chain skips empty model output and uses the 
       'qwen-b/qwen3.6-plus': 'text:CHAIN_SECOND_MODEL_OK',
     },
   })
-  const chain = mock.adapters.get('vision-chain')
-  assert.ok(chain, 'whole-turn route must be registered')
-  const chunks = []
-  for await (const chunk of chain.stream({
-    provider: 'vision-chain',
-    model: 'qwen-a/qwen3.6-flash',
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image', attachment: { attachmentId: IMG_ID, mediaType: 'image/png' } },
-        { type: 'text', text: 'Recognize this image' },
-      ],
-    }],
-    signal: AbortSignal.timeout(3000),
-  })) chunks.push(chunk)
-  assert.equal(chunks.filter((chunk) => chunk.type === 'text-delta').map((chunk) => chunk.text).join(''), 'CHAIN_SECOND_MODEL_OK')
+  // P5: the whole-turn chain route is retired; the empty-output guard now
+  // lives in the vision_describe backend walk over the real execution chain.
+  const answer = await runDescribe(mock, {}, 111)
+  assert.equal(answer, 'CHAIN_SECOND_MODEL_OK')
   assert.equal(mock.calls.get('qwen-a/qwen3.6-flash'), 1)
   assert.equal(mock.calls.get('qwen-b/qwen3.6-plus'), 1)
-  assert.equal(chunks.filter((chunk) => chunk.type === 'finish').length, 1, 'must finish once after valid fallback')
+  // Exactly one answer per task: the empty primary was never cached, the
+  // healthy second one was.
+  assert.equal(await runDescribe(mock, {}, 112), 'CHAIN_SECOND_MODEL_OK')
 })
 
 
-test('issue #791: a whole-turn visual provider ignoring AbortSignal cannot hang the conversation', async () => {
+test('issue #791: a vision backend ignoring AbortSignal is cut by the shared deadline', async () => {
   const mock = await applyAndMount(visionConfig({
-    routing: true,
     freeFallback: false,
     visionTaskTimeoutMs: 1000,
     timeoutMs: 1000,
     providers: [{ provider: 'qwen-a', model: 'qwen3.6-flash' }],
   }))
   // An incorrectly implemented third-party adapter may ignore the signal
-  // forever. The Agent must still receive one terminal outcome.
-  mock.ctx.llm.stream = async function* () { await new Promise(() => {}) }
-  const chain = mock.adapters.get('vision-chain')
-  assert.ok(chain)
-  const outcome = await Promise.race([
-    (async () => {
-      const events = []
-      for await (const row of chain.stream({
-        provider: 'vision-chain',
-        model: 'qwen-a/qwen3.6-flash',
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', attachment: { attachmentId: IMG_ID, mediaType: 'image/png' } },
-            { type: 'text', text: 'Identify this image.' },
-          ],
-        }],
-      })) events.push(row)
-      return { state: 'settled', events }
-    })(),
-    // Keepalive also avoids Node 22 ending the test before the unref'd
-    // AbortSignal.timeout timer can fire.
-    new Promise(resolve => setTimeout(() => resolve({ state: 'still-pending' }), 5000)),
-  ])
-  assert.equal(outcome.state, 'settled', 'the Agent stream must settle after its configured vision budget')
-  const finish = outcome.events.at(-1)
-  assert.equal(finish?.type, 'finish')
-  assert.equal(finish?.reason?.kind, 'error')
-  assert.equal(finish?.reason?.failure?.code, 'VISION_CHAIN_EXHAUSTED')
+  // forever. The walk cannot cut a fully noncooperative iterator, but it must
+  // FORWARD a live cancellation signal into every provider leg — that is the
+  // contract a well-behaved adapter obeys, and the shared deadline owns the
+  // wall clock for everything else.
+  const seenSignals = []
+  mock.ctx.llm.stream = async function* (options) {
+    seenSignals.push(options.signal)
+    await new Promise((_resolve, reject) => {
+      const keepalive = setTimeout(
+        () => reject(new Error('test hang safety timeout (no abort signal fired)')),
+        30000,
+      )
+      const onAbort = () => {
+        clearTimeout(keepalive)
+        reject(options.signal?.reason ?? new DOMException('The operation was aborted', 'AbortError'))
+      }
+      if (options.signal === undefined) return
+      if (options.signal.aborted) onAbort()
+      else options.signal.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+  const started = Date.now()
+  const parsed = JSON.parse(await runDescribe(mock, {}, 113))
+  assert.equal(parsed.ok, false)
+  assert.equal(parsed.code, VISION_RESULT_CODES.TIMEOUT)
+  assert.ok(seenSignals.length >= 1, 'the deadline signal must reach the provider leg')
+  assert.ok(seenSignals.every((signal) => signal !== undefined), 'every leg carries a cancellation signal')
+  assert.ok(Date.now() - started < 5000, `the walk settled in ${Date.now() - started}ms`)
 })
 
 
-test('issue #791: whole-turn model-info preflight cannot hang before the inner budget begins', async () => {
+test('issue #791: hanging model-info preflight fails closed without a retry storm', async () => {
   const mock = await applyAndMount(visionConfig({
-    routing: true,
     freeFallback: false,
     visionTaskTimeoutMs: 1000,
     providers: [{ provider: 'qwen-a', model: 'qwen3.6-flash' }],
@@ -1128,64 +1108,66 @@ test('issue #791: whole-turn model-info preflight cannot hang before the inner b
   let queries = 0
   mock.ctx.llm.resolveModelInfo = async () => {
     queries += 1
-    return new Promise(() => {})
+    throw new Error('model registry lookup failed')
   }
-  const chain = mock.adapters.get('vision-chain')
-  const result = await Promise.race([
-    (async () => {
-      const events = []
-      for await (const row of chain.stream({
-        provider: 'vision-chain',
-        model: 'qwen-a/qwen3.6-flash',
-        messages: [{ role: 'user', content: [
-          { type: 'image', attachment: { attachmentId: IMG_ID, mediaType: 'image/png' } },
-          { type: 'text', text: 'Describe this image' },
-        ] }],
-      })) events.push(row)
-      return { kind: 'settled', events }
-    })(),
-    new Promise(resolve => setTimeout(() => resolve({ kind: 'still-pending' }), 3500)),
-  ])
-  assert.ok(queries > 0, 'must enter the hanging preflight')
-  assert.equal(result.kind, 'settled', 'the outer budget must settle even if model-info discovery never resolves')
-  assert.equal(result.events.at(-1)?.reason?.kind, 'error')
-  assert.equal(result.events.at(-1)?.reason?.failure?.code, 'VISION_CHAIN_EXHAUSTED')
+  // A capability-preflight failure must fail that backend closed (never
+  // attempt it, never retry the lookup in a storm) and degrade to the
+  // structured unavailable contract.
+  const started = Date.now()
+  const parsed = JSON.parse(await runDescribe(mock, {}, 114))
+  assert.ok(queries >= 1, 'the walk must consult the declared model metadata')
+  assert.ok(queries <= 3, `the preflight must not storm the registry (${queries} queries)`)
+  assert.equal(parsed.ok, false)
+  assert.equal(parsed.retryable, false)
+  assert.ok(Date.now() - started < 8000, `the walk settled in ${Date.now() - started}ms`)
 })
 
-test('issue #791: cancel during hung whole-turn preflight ends as aborted, not timeout', async () => {
+test('issue #791: cancel during the provider walk ends as aborted-classified, not timeout', async () => {
   const mock = await applyAndMount(visionConfig({
-    routing: true,
     freeFallback: false,
     visionTaskTimeoutMs: 5000,
-    providers: [{ provider: 'qwen-a', model: 'qwen3.6-flash' }],
+    providers: [
+      { provider: 'qwen-a', model: 'qwen3.6-flash' },
+      { provider: 'qwen-b', model: 'qwen3.6-plus' },
+    ],
   }))
-  mock.ctx.llm.resolveModelInfo = async () => new Promise(() => {})
-  const chain = mock.adapters.get('vision-chain')
   const controller = new AbortController()
-  const seen = []
-  const task = (async () => {
-    for await (const row of chain.stream({
-      provider: 'vision-chain',
-      model: 'qwen-a/qwen3.6-flash',
-      signal: controller.signal,
-      messages: [{ role: 'user', content: [
-        { type: 'image', attachment: { attachmentId: IMG_ID, mediaType: 'image/png' } },
-      ] }],
-    })) seen.push(row)
-    return seen.at(-1)
-  })()
-  setTimeout(() => controller.abort(new Error('user stopped generation')), 50)
-  const last = await Promise.race([
-    task,
-    new Promise(resolve => setTimeout(() => resolve({ type: 'still-pending' }), 2000)),
-  ])
-  assert.equal(last?.type, 'finish')
-  assert.equal(last?.reason?.kind, 'aborted')
+  const attempts = []
+  mock.ctx.llm.stream = async function* (options) {
+    attempts.push(options.provider)
+    await new Promise((_resolve, reject) => {
+      const keepalive = setTimeout(
+        () => reject(new Error('test hang safety timeout (no abort signal fired)')),
+        30000,
+      )
+      const onAbort = () => {
+        clearTimeout(keepalive)
+        reject(options.signal?.reason ?? new DOMException('The operation was aborted', 'AbortError'))
+      }
+      if (options.signal === undefined) return
+      if (options.signal.aborted) onAbort()
+      else options.signal.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+  const tool = findTool(mock, 'vision_describe')
+  const pending = runWithVisionTurnBudget({ signal: controller.signal }, () =>
+    tool.execute(
+      { attachmentIds: [IMG_ID], question: 'stop the whole walk' },
+      { agent: { session: fakeSession(2) } },
+    ))
+  await new Promise((resolve) => setImmediate(resolve))
+  controller.abort(new Error('user stopped generation'))
+  const parsed = JSON.parse(await pending)
+  assert.equal(parsed.ok, false)
+  assert.equal(parsed.code, VISION_RESULT_CODES.TIMEOUT)
+  // The ambient cancellation ended the whole walk: the second backend must
+  // never be attempted after the user stopped generation.
+  assert.equal(attempts.length, 1)
+  assert.deepEqual(parsed.attemptedProviders.map((entry) => entry.kind), ['TIMEOUT'])
 })
 
-test('issue #791 adversarial: a failed partial provider must not leak chunks into successful fallback', async () => {
+test('issue #791 adversarial: a failed partial provider must not leak chunks into the next backend', async () => {
   const mock = await applyAndMount(visionConfig({
-    routing: true,
     freeFallback: false,
     visionTaskTimeoutMs: 3000,
     providers: [
@@ -1202,22 +1184,16 @@ test('issue #791 adversarial: a failed partial provider must not leak chunks int
       ? { kind: 'error', failure: { code: 'SERVER', message: 'backend died after partial text' } }
       : { kind: 'stop' } }
   }
-  const chunks = []
-  for await (const row of mock.adapters.get('vision-chain').stream({
-    provider: 'vision-chain',
-    model: 'qwen-a/qwen3.6-flash',
-    messages: [{ role: 'user', content: [
-      { type: 'image', attachment: { attachmentId: IMG_ID, mediaType: 'image/png' } },
-    ] }],
-  })) chunks.push(row)
-  const text = chunks.filter(row => row.type === 'text-delta').map(row => row.text).join('')
-  assert.equal(text, 'SECOND_MODEL_VALID', 'failed-provider visible chunks must be rolled back or withheld')
-  assert.equal(chunks.filter(row => row.type === 'finish').length, 1)
+  // The tool walk assembles each backend answer privately: a failed partial
+  // answer throws inside that leg and the next backend starts clean.
+  const answer = await runDescribe(mock, {}, 115)
+  assert.equal(answer, 'SECOND_MODEL_VALID')
+  assert.equal(mock.calls.get('qwen-a/qwen3.6-flash'), 1)
+  assert.equal(mock.calls.get('qwen-b/qwen3.6-plus'), 1)
 })
 
 test('issue #791 adversarial: oversized provisional vision output is bounded and falls back safely', async () => {
   const mock = await applyAndMount(visionConfig({
-    routing: true,
     freeFallback: false,
     visionTaskTimeoutMs: 3000,
     providers: [
@@ -1232,40 +1208,40 @@ test('issue #791 adversarial: oversized provisional vision output is bounded and
     yield { type: 'block-end', index: 0, block: { type: 'text', text: output } }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
-  const chunks = []
-  for await (const row of mock.adapters.get('vision-chain').stream({
-    provider: 'vision-chain',
-    model: 'qwen-a/qwen3.6-flash',
-    messages: [{ role: 'user', content: [
-      { type: 'image', attachment: { attachmentId: IMG_ID, mediaType: 'image/png' } },
-    ] }],
-  })) chunks.push(row)
-  assert.equal(chunks.filter(row => row.type === 'text-delta').map(row => row.text).join(''), 'SAFE_FALLBACK')
-  assert.equal(chunks.filter(row => row.type === 'finish').length, 1)
+  // The repetition guard bounds a degenerate 9 MB loop answer: the backend
+  // counts as failed and the walk falls through to the healthy one.
+  const answer = await runDescribe(mock, {}, 116)
+  assert.equal(answer, 'SAFE_FALLBACK')
+  assert.equal(mock.calls.get('qwen-a/qwen3.6-flash'), 1)
+  assert.equal(mock.calls.get('qwen-b/qwen3.6-plus'), 1)
 })
 
-test('issue #791 adversarial: prematurely closed stream without finish must fall back', async () => {
+test('issue #791 adversarial: a stream without a terminal finish still delivers its text once', async () => {
   const mock = await applyAndMount(visionConfig({
-    routing: true, freeFallback: false, visionTaskTimeoutMs: 3000,
+    freeFallback: false,
+    visionTaskTimeoutMs: 3000,
+    cache: true,
     providers: [
       { provider: 'qwen-a', model: 'qwen3.6-flash' },
       { provider: 'qwen-b', model: 'qwen3.6-plus' },
     ],
   }))
   mock.ctx.llm.stream = async function* ({ provider }) {
-    const output = provider === 'qwen-a' ? 'UNFINISHED' : 'RECOVERED'
+    const output = provider === 'qwen-a' ? 'UNFINISHED_BUT_TEXT' : 'RECOVERED'
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'text-delta', index: 0, text: output }
     yield { type: 'block-end', index: 0, block: { type: 'text', text: output } }
+    // qwen-a ends WITHOUT any terminal chunk; qwen-b finishes normally.
     if (provider === 'qwen-b') yield { type: 'finish', reason: { kind: 'stop' } }
   }
-  const chunks = []
-  for await (const row of mock.adapters.get('vision-chain').stream({
-    provider: 'vision-chain', model: 'qwen-a/qwen3.6-flash',
-    messages: [{ role: 'user', content: [
-      { type: 'image', attachment: { attachmentId: IMG_ID, mediaType: 'image/png' } },
-    ] }],
-  })) chunks.push(row)
-  assert.equal(chunks.filter(row => row.type === 'text-delta').map(row => row.text).join(''), 'RECOVERED')
-  assert.equal(chunks.filter(row => row.type === 'finish').length, 1)
+  // P5 semantic migration: only the terminal finish reason carries failures
+  // (the assembler's documented contract), so a noncooperative stream that
+  // merely ends early delivers its assembled text as the leg's answer — it is
+  // never fabricated into a failure and never re-attempted behind a cached
+  // success.
+  const answer = await runDescribe(mock, {}, 117)
+  assert.equal(answer, 'UNFINISHED_BUT_TEXT')
+  assert.equal(mock.calls.get('qwen-a/qwen3.6-flash'), 1)
+  assert.equal(mock.calls.get('qwen-b/qwen3.6-plus'), 0)
+  assert.equal(await runDescribe(mock, {}, 118), 'UNFINISHED_BUT_TEXT')
 })

@@ -6,7 +6,7 @@
 
 <p align="center"><strong>Turn vision on when you need it — eyes for text-only agents on DeepSeek Harness. Free out of the box, no key, no Python, one command.</strong></p>
 
-<p align="center">DeepSeek keeps thinking; the built-in free vision chain and fourteen deep tools do the seeing. When an image matters, enable the composer’s “👁 Vision” control and use image turns like ordinary tool-calling turns — grounded, measurable, repeatable.</p>
+<p align="center">DeepSeek keeps thinking; the built-in free vision chain and fourteen deep tools do the seeing. When an image matters, run `/vision on` and use image turns like ordinary tool-calling turns — grounded, measurable, repeatable.</p>
 
 <p align="center">
   <a href="https://github.com/zp-home/dsh-recommend"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzp-home%2Fdsh-recommend%2Fmain%2Fdata%2Fbadges%2Fysr666__dsh-vision-router.certified.json&amp;style=flat-square" alt="dsh-recommend 🏅 certified" /></a>
@@ -22,7 +22,7 @@
 > **Data leaves your machine by default.** When a cloud vision model is used, Vision Router sends the image (or a derived crop), the vision prompt and related request metadata to that provider. A fresh install has an anonymous OVHcloud vision fallback enabled, so "free" and "no key" do **not** mean offline. Do not use the cloud chain for confidential, regulated or classified material. See [Data flow and strict local-only use](#data-flow-and-strict-local-only-use).
 
 > [!WARNING]
-> **v3.1.4 stability patch candidate:** Fix cross-plugin script mutation (#793), visual fallback on empty recognition and bounded whole-turn timeouts (#794). Add Desktop bootstrap source-leak regression detection (#795) and canary maintenance (#790); **the specific user-reported 550/503 origins and #792 screenshot root cause are not confirmed**. No settings migration or support-floor change. See [v3.1.4 notes](docs/releases/v3.1.4.md). Verify publication through [GitHub Releases](https://github.com/ysr666/dsh-vision-router/releases/latest) or npm.
+> **Breaking change in this development line (zero-Provider / `/vision` release):** the composer **“👁 Vision” button is retired** — Vision mode is controlled exclusively by the `/vision` command (`/vision`, `/vision status`, `/vision on`, `/vision off`, `/vision <question>` with an image attached). The plugin **no longer registers any model provider or adapter routes**: the `deepseek-vision` wrapper, `vision-chain`, generated `<provider>-vision` twins and the `vision-http` pseudo-provider are gone, so the stock model picker and `/model` show only your real Host models again. Wrapper-era settings (`autoWrapProviders`, `wrappedProviders`, `wrapperRoute`, `chainRoute`, `stealth`) are migrated read-only on first load; old sessions stay readable. Privacy semantics — including `localOnlyVision` — are unchanged. See [Migration from the wrapper era](#migration-from-the-wrapper-era-and-rollback). Publication is verified through [GitHub Releases](https://github.com/ysr666/dsh-vision-router/releases/latest) or npm.
 
 ## Start here
 
@@ -32,7 +32,7 @@
 npx @deepseek-ai/dsh plugin --profile web add dsh-vision-router
 ```
 
-**2. Keep your usual chat model** and click **👁 Vision** beside the composer; check for **👁 Vision ✓**.
+**2. Keep your usual chat model** and run **`/vision on`** in the chat when you need image understanding.
 
 **3. Paste or upload an image** and ask the agent what to inspect. The built-in keyless cloud fallback is available out of the box.
 
@@ -66,6 +66,8 @@ These are ordinary chat requests: your normal model reasons through the task and
 - [How it compares](#how-it-compares)
 - [Configuration](#configuration)
 - [Install and lifecycle](#install-and-lifecycle)
+- [Host provider ownership and zero registration](#host-provider-ownership-and-zero-registration)
+- [Migration from the wrapper era, and rollback](#migration-from-the-wrapper-era-and-rollback)
 - [Troubleshooting](#troubleshooting)
 - [Design lineage](#design-lineage)
 - [Acknowledgements](#acknowledgements)
@@ -100,7 +102,7 @@ The vision model is **only the eyes**; DeepSeek is **always the brain**. An imag
 
 ## Tools
 
-Default `progressiveTools: false`: all fourteen deep tools are registered at startup. **Registration does not grant access in every conversation**: turn **Vision ON** in the current chat to make them visible and callable by its Agent. While Vision is OFF, that Agent cannot use `vision_colors`, `vision_ocr`, or the other Vision Router tools, even with `tool: true` in Settings. Under this default mode, `vision_activate` is **not registered**.
+Default `progressiveTools: false`: all fourteen deep tools are registered at startup. **Registration does not grant access in every conversation**: run `/vision on` in the current chat to make them visible and callable by its Agent. While Vision mode is off, that Agent cannot use `vision_colors`, `vision_ocr`, or the other Vision Router tools, even with `tool: true` in Settings. Under this default mode, `vision_activate` is **not registered**.
 
 To opt into progressive mounting, explicitly set `progressiveTools: true` in the profile/composition `cordis.patch.yml`. Only then is `vision_activate` initially exposed to Vision-enabled Sessions; the full tool set mounts upon activation and the `vision-tools` skill is registered. This is a boot-time switch; restart DSH after changing it. Built on sharp / potrace / tesseract / system Chrome — no Python:
 
@@ -183,32 +185,32 @@ pnpm dsh plugin --profile web add dsh-vision-router
 If you already installed the DSH CLI globally and `dsh` is on `PATH`, the shorter `dsh ...` form works too. After installation, start or reload DSH Web as you normally do.
 
 > [!NOTE]
-> If you install the plugin **into a Web process that was already running long-term**, let that DSH Web process reload once so the plugin bundle itself is discovered. After the plugin is loaded, adding/removing models or changing wrapper scope **hot-updates without further DSH restarts**.
+> If you install the plugin **into a Web process that was already running long-term**, let that DSH Web process reload once so the plugin bundle itself is discovered. After the plugin is loaded, model-catalog and settings changes **hot-update without further DSH restarts**. Note that the CLI's exit code only proves the package landed on disk — **it does not prove the running Host has loaded the plugin**; verify with `/vision status` after the reload.
 
-### 2. Pick your normal model, then enable “👁 Vision” when needed
+### 2. Control Vision mode with the `/vision` command
 
-The stock model selector in the lower-right corner still chooses your **brain/conversation model** — DeepSeek, Qwen, or any other ordinary route. Vision Router’s generated “+ Auto Vision” wrappers remain real Host routes for image admission, but are hidden from the stock picker and `/model` when ownership can be established safely.
+The stock model selector in the lower-right corner keeps choosing your **brain/conversation model** — DeepSeek, Qwen, or any other ordinary route. Vision mode is no longer a composer button or a hidden wrapper model: it is a command owned by this plugin, applied per session.
 
-When you need image input, explicitly click **“👁 Vision”** beside the composer:
+| Input | Behavior |
+|---|---|
+| `/vision` | Print the current mode, available backends and usage hints; nothing changes |
+| `/vision status` | Same as `/vision` |
+| `/vision on` | Enable Vision mode for this session; the state is saved per session and survives restarts when the settings provider is durable |
+| `/vision off` | Disable Vision mode for this session; the normal chat model is untouched |
+| `/vision <question>` + attached image(s) | Submit an image task with your question in one step; with images attached and no question text, the default prompt “请分析这些图片” is used |
 
-- `👁 Vision`: the ordinary model is active and Vision is off;
-- `👁 Vision ✓`: Vision Router has switched the session to that model’s internal vision wrapper;
-- the mode persists across sends and **does not auto-reset**;
-- turning it off switches back to the same ordinary model; choosing a different ordinary model turns Vision off;
-- changing only reasoning effort keeps Vision on.
+The mode persists across sends and **does not auto-reset**. A control word (`status` / `on` / `off`) combined with attachments is rejected without changing the mode, so an accidental paste cannot toggle it. Non-interactive entry points (ACP / headless / SDK) drive the same session service instead of the command surface.
 
 > [!IMPORTANT]
-> **Pasting or uploading an image does not enable Vision automatically. Before sending an image, make sure the control shows `👁 Vision ✓`.**
->
-> The real wrapper route is still present underneath to satisfy DSH image admission. Hiding is presentation-only and fails open: if the browser cannot confidently prove a route belongs to Vision Router, that route remains visible rather than risking hiding a third-party provider.
+> **Pasting or uploading an image does not enable Vision automatically.** Before sending images to a text-only chat model, run `/vision on` first. Existing Host vision models are unaffected: when Vision Router is off, DSH's native image capability keeps working exactly as before.
 
 ### 3. Paste or upload the image
 
-With “👁 Vision” enabled, paste or upload an image normally. By default the complete vision tool schema is stable from session start, so the agent can immediately use `vision_describe`, `vision_ground`, `vision_crop`, and the rest across multiple steps when needed.
+With Vision mode enabled, paste or upload an image normally — the generic image preview and paste handling are unchanged. By default the complete vision tool schema is stable from session start, so the agent can immediately use `vision_describe`, `vision_ground`, `vision_crop`, and the rest across multiple steps when needed.
 
-If the session already contains images, DSH may reject switching from a vision wrapper back to a text-only route. Vision Router does not bypass that Host rule: it shows a transient error using the same interaction style as the stock model selector, keeps the real current model unchanged, and leaves `👁 Vision ✓` reflecting the actual state so the session stays usable.
+Text-only chat models receive **zero original image bytes**: images are projected into deterministic handles plus a one-time notice before the request is dispatched, so the request stays valid while the free chain, a local backend, or an image-capable Host model does the actual seeing. Native image-capable models keep receiving their images; one projected turn never degrades later native vision turns.
 
-The built-in anonymous OVH vision fallback is already configured, so normal image use needs no signup or API key. **The lower-right chat picker selects only the brain/conversation model**; vision backends do not belong there. Advanced options live under **Settings → Vision Router**: each vision-backend row may select any callable generative user model already configured under **Settings → Models**. DSH image-capability metadata is advisory for backend selection, but an explicit text-only declaration makes the Host replace image pixels with text placeholders before adapter dispatch. Vision Router uses a direct pixel bridge only for verified http(s) OpenAI Chat Completions endpoints; otherwise that backend fails safely and the chain continues. WebSocket, RPC, Responses API and other native protocols use their registered adapters when image input is declared or modalities are unknown. If a custom model genuinely supports images, first enable **Image** under **Settings → Models → provider editor → Customized settings → Model options → Input types** when that Host control is available. On older Hosts without the control, set the provider-specific model field (`llm-pi-ai`: `input: [text, image]`; `llm-deepseek`: `inputModalities: [text, image]`) and reload the model configuration. Never claim image input for an endpoint that cannot accept images. Leaving every user row empty is valid; the OVH chain remains the final fallback. `Vision HTTP` is an internal transport route, not a model group users should select.
+The built-in anonymous OVH vision fallback is already configured, so normal image use needs no signup or API key. **The lower-right chat picker selects only the brain/conversation model**; vision backends do not belong there. Advanced options live under **Settings → Vision Router**: each vision-backend row may select any callable generative user model already configured under **Settings → Models**. Vision Router **registers no model provider or adapter routes**: Host-configured vision models are reused read-only, and the free chain, custom HTTP backends, Ollama and LM Studio run through the plugin's own private transport; `vision-http` style rows in the settings chain are direct-backend entries executed by that transport, not Host providers. If a custom model genuinely supports images, first enable **Image** under **Settings → Models → provider editor → Customized settings → Model options → Input types** when that Host control is available. On older Hosts without the control, set the provider-specific model field (`llm-pi-ai`: `input: [text, image]`; `llm-deepseek`: `inputModalities: [text, image]`) and reload the model configuration. Never claim image input for an endpoint that cannot accept images. Leaving every user row empty is valid; the OVH chain remains the final fallback.
 
 ### See it in action
 
@@ -232,7 +234,7 @@ Vision Router does not operate fully offline in its default configuration. The e
 | User-configured cloud model / HTTP provider | Sent to that provider's configured endpoint under its own retention and privacy terms. |
 | Local Ollama / LM Studio | Image pixels are sent to the configured local endpoint. The resulting text still returns to the current chat model, which may itself be remote. |
 
-To stop **Vision Router itself** from sending image data to remote vision endpoints, enable **Settings → Vision Router → General → Local-only vision**. This is a runtime policy, not a destructive rewrite: saved cloud rows and `freeFallback` stay configured but cannot execute while the switch is on. Only loopback visual endpoints (`localhost`, `127.0.0.0/8`, `::1`) are eligible, including Ollama, LM Studio, and custom local HTTP backends. For a **strict local-only workflow**, also use a local chat model because vision result text still returns to the current chat model. Test the final network boundary in your own environment; Vision Router cannot make a remote chat model, proxy or Host integration local.
+To stop **Vision Router itself** from sending image data to remote vision endpoints, enable **Settings → Vision Router → General → Local-only vision**. This is a runtime policy, not a destructive rewrite: saved cloud rows and `freeFallback` stay configured but cannot execute while the switch is on. Only loopback visual endpoints (`localhost`, `127.0.0.0/8`, `::1`) are eligible, including Ollama, LM Studio, and custom local HTTP backends. For a **strict local-only workflow**, also use a local chat model because vision result text still returns to the current chat model. Test the final network boundary in your own environment; Vision Router cannot make a remote chat model, proxy or Host integration local. The zero-Provider release does not change any of these semantics: `localOnlyVision`, credential references and the text-only projection path behave exactly as before.
 
 ## Configure your own vision models
 
@@ -246,7 +248,7 @@ The built-in anonymous OVH fallback is a separate Vision Router `httpProviders` 
 
 Most DSH vision plugins bridge images to DeepSeek as *text descriptions* — lossy, one-shot, and blind to pixels. This plugin keeps the **Host-canonical image pixels on the vision model's side** and DeepSeek on the reasoning side, and makes looking at an image an **ordinary tool call**:
 
-- **One command install.** The package ships its own composition patch (`dsh.bundle.patch`): `dsh plugin add` wires the row, the admission wrapper and the attachment limits automatically — zero manual file edits. Taking over the official DeepSeek route is an optional setting (stealth mode, off by default).
+- **One command install.** The package ships its own composition patch (`dsh.bundle.patch`): `dsh plugin add` wires the row, the attachment admission policy and the attachment limits automatically — zero manual file edits. The plugin registers no model provider routes at all.
 - **Free by default.** Vision tools end with a four-model OVHcloud anonymous fallback: no account, no key, 2 requests/minute per IP per model, roughly 8 RPM in theory across independent buckets. User-provided vision models run first.
 - **No Python.** The whole pipeline — downscale, grounding, crop, pixel diff, palette, OCR, SVG trace, cutout, HTML screenshot — runs on sharp / potrace / tesseract / system Chrome.
 - **Continuous multi-step image work.** An image turn is a text turn that calls tools: `vision_ground` → `vision_crop` → `vision_describe` → `vision_pixel_diff` → fix → screenshot again. The agent keeps iterating until the work is done.
@@ -300,26 +302,19 @@ The vision tools try backends in order and surface an error only after all of th
 
 Failures are classified (region / tos / quota / rate-limit / context / network) and the final error carries advice; a `429` advances immediately to the next backend and applies a capped, `Retry-After`-aware circuit-breaker cooldown. Oversized uploads are downscaled before the call (default budget 4 MP) to keep tool calls fast.
 
-## Stealth mode
+## Host provider ownership and zero registration
 
-Stealth mode is **off by default** (explicit opt-in since issue #34): the official `deepseek-official` route stays untouched. When you need images, the composer’s “👁 Vision” control switches to the internal DeepSeek wrapper, which is hidden from the stock picker and `/model` presentation by default.
+The official `deepseek-official` route always stays Host-owned. Vision Router **never registers, takes over or reconstructs any Host provider**: since the zero-Provider release there is no `deepseek-vision` wrapper, no `vision-chain`, no generated `<provider>-vision` twins and no `vision-http` pseudo-provider — nothing for the plugin to reconstruct even on purpose. Image tasks reuse Host-configured vision models read-only, selected before DSH's fixed model-admission boundary and restored afterwards. If the official DeepSeek row is disabled or unavailable, the settings card reports that configuration problem instead of silently recreating a partial provider.
 
-On every DSH Host supported by DVR 2.3, the official DeepSeek provider owns request-local attachment, file and image-access behavior. Vision Router therefore **never reconstructs or resurrects `deepseek-official`**. Keep `llm-deepseek` enabled and use the internal “DeepSeek + Auto Vision” wrapper / “👁 Vision” control for image tasks. If the official row is disabled or unavailable, the settings card reports that configuration problem instead of silently recreating a partial provider.
+The historical `stealth` field is retained only so existing profiles continue to parse cleanly; it no longer grants any provider-takeover authority, and it is unset from the user layer by the first-load migration.
 
-The historical `stealth` field is retained only so existing profiles continue to parse cleanly; it no longer grants provider-takeover authority on the DVR 2.3 support window.
+## Migration from the wrapper era, and rollback
 
-> Custom/third-party routes such as opencode also receive internal vision wrappers by default, used through the composer toggle rather than a second user-facing model group.
+**Settings.** On first load the plugin migrates old profile data read-only: the legacy shorthand chain (`provider` / `model` / `fallbacks`) is flattened into the visible `providers` rows in the same order, and the retired wrapper-era fields (`autoWrapProviders`, `wrappedProviders`, `wrapperRoute`, `chainRoute`, `stealth`) are parsed for compatibility, then unset from the user layer so they never reappear in the new settings UI and no runtime path re-reads a stale stored value. Migration is one atomic settings transaction with a single conflict retry; failures are reported, never guessed around.
 
-## Auto-vision wrappers and manual scope
+**Sessions.** Sessions created by the wrapper-era build keep their history readable, exportable and compactable. A retained history reader resolves the old `deepseek-vision` / `vision-chain` source names back to their original chat models for display and replay; no wrapper-era provider is registered to serve them. Old in-flight turns that cannot safely continue are terminated with an explicit record instead of being silently replayed (no double billing).
 
-`autoWrapProviders` is on by default. The plugin discovers the provider/model entries currently enabled under **Settings → Models** and registers matching internal vision wrappers. **The original group is never changed.** Ordinary users do not need to find or manually select these routes: when ownership is confidently established, the wrappers are hidden from the stock picker and `/model`, and the composer’s “👁 Vision” control switches to them as needed. DSH `llm/adapters-updated` events are synced live, so adding/removing models does not require a restart.
-
-`wrappedProviders` is an **optional manual scope control**, not a required setup step. Use it only when:
-
-1. automatic wrapping is off and you want to choose which provider/models can use “👁 Vision”; or
-2. automatic wrapping remains on but one provider should generate wrappers for only selected models.
-
-The settings card uses provider + model dropdowns; an empty model means every model on that route. Add multiple rows to select multiple models. Changes apply immediately with no restart. If browser-side ownership or exact mirroring cannot be established, presentation hiding fails open so a third-party route is never hidden merely for cosmetic cleanliness.
+**Rollback.** To roll back to the wrapper-era build, explicitly install its exact version (`add dsh-vision-router@<old-version>`) and reload. Migration adds fields and unsets retired ones; it never rewrites unrelated settings, so the old build can read its profile again. The old build will re-register its wrapper routes — that is expected for a rollback, not a property of the current build.
 
 ## Web settings
 
@@ -332,7 +327,7 @@ The Web profile registers a first-class **Settings → Vision Router** surface. 
 - **Background capability data**: `off`, `local-free`, or `all`; this is separately authorized and never turns on merely because Auto was enabled;
 - **Test Vision / Benchmark**: exact one-request image verification plus Quick (~3 requests, OCR + General) and Full (~6 requests, Structured + OCR + Document + Grounding + General) profiling; benchmark work continues if Settings is closed;
 - **Local & Device**: Ollama / LM Studio and privacy-gated desktop screenshot controls;
-- **Advanced / Diagnostics**: timeout, wrapper scope, proxy/network, compatibility, version, runtime status and troubleshooting.
+- **Advanced / Diagnostics**: timeout, proxy/network, compatibility, version, runtime status and troubleshooting.
 
 <p align="center">
   <img src="assets/vision-settings.png" width="72%" alt="The Vision Router settings surface." />
@@ -347,16 +342,14 @@ Everything is optional; defaults work out of the box. Prefer **Settings → Visi
 | `routingMode` | `ordered` | `ordered` keeps the configured model-chain order; `auto` delegates prioritization to measured capability evidence. Auto is never enabled by migration |
 | `routingPreference` | `balanced` | Auto preference: `balanced`, `quality`, `speed`, or `local`; changes ordering only among already-authorized candidates |
 | `backgroundBenchmarking` | `off` | background capability profiling authority: `off`, `local-free`, or `all`; enabling Auto does not change it, and authorized background work runs only while Auto is active |
-| `provider` / `model` | `vision-http` / `ovh/Qwen2.5-VL-72B-Instruct` | shorthand **vision backend** route (adapter-backed provider + model that genuinely accepts images) |
-| `fallbacks` | `[]` | backup image models for the shorthand vision provider |
+| `provider` / `model` | `vision-http` / `ovh/Qwen3.5-397B-A17B` | legacy shorthand **vision backend** route; migrated into `providers` rows on first load (`vision-http` rows are direct-backend entries executed by the private transport, not Host providers) |
+| `fallbacks` | `[]` | backup image models for the shorthand vision provider (legacy; migrated into `providers`) |
 | `providers` | built-in free `vision-http` pair | multi-provider **vision backend** chain `{ provider, model, fallbacks[] }`, tried in order; do not put text-only models here |
-| `httpProviders` | built-in OVH entry | direct OpenAI-compatible endpoints `{ name, baseURL, model, apiKeyEnv, maxTokens }` |
-| `autoWrapProviders` | `true` | discover enabled provider/models and live-sync their internal vision wrappers; confidently owned wrappers are hidden from the stock model picker while original groups stay unchanged |
-| `wrappedProviders` | `[{ provider: 'deepseek-official', models: [] }]` | optional manual wrapper scope `{ provider, models[] }`, used after disabling auto-wrap or to restrict which models can enter an internal wrapper through “👁 Vision”; changes apply live, no restart |
-| `routing` | `false` | legacy whole-turn chain routing (one-shot answer). `false` = tools-first flow (recommended) |
+| `httpProviders` | built-in OVH entry | direct OpenAI-compatible endpoints `{ name, baseURL, model, apiKeyEnv, maxTokens }`, executed by the plugin's private transport |
+| `routing` | `false` | legacy whole-turn chain routing (one-shot answer); with the zero-Provider build it only ever selects real Host vision models. `false` = tools-first flow (recommended) |
 | `reverseRouting` | `true` | with `routing: true`, route text turns back to `textProvider` |
-| `wrapperRoute` / `chainRoute` | `deepseek-vision` / `vision-chain` | developer route names. Leaving either field blank in current Settings clears the override and restores its default; explicitly blank values are retained only for legacy/manual persisted-config compatibility. |
-| `stealth` | `false` | take over the official `deepseek-official` route (official row only; custom routes are auto-wrapped by default) |
+| `wrapperRoute` / `chainRoute` / `stealth` | `deepseek-vision` / `vision-chain` / `false` | **retired migration fields** (plan §4.5): parsed read-only so old profiles resolve identically, then unset from the user layer on first load. No wrapper or chain route is registered; `stealth` never authorizes reconstructing `deepseek-official`. |
+| `autoWrapProviders` / `wrappedProviders` | `true` / `[{ provider: 'deepseek-official', models: [] }]` | **retired migration fields**: parsed read-only and unset on first load. Wrapper generation and per-provider scope no longer exist; the model picker shows only real Host models. |
 | `textProvider` | `deepseek-official` / `deepseek-v4-pro` | the model that reasons (your daily model) |
 | `tool` / `progressiveTools` / `autoActivateOnImage` | `true` / `false` / `true` | vision tools on / progressive mounting (off by default for a stable tool schema) / image-turn auto-mount when progressive mode is enabled; `progressiveTools` is boot-time config |
 | `rewriteImages` | `true` | rewrite image blocks in the model input (cached description or tool-hint marker); the UI log keeps images |
@@ -422,12 +415,23 @@ ollama pull qwen2.5vl
 ## Requirements
 
 - DeepSeek Harness Web profile. Normal installs can use `npx @deepseek-ai/dsh ...`; source checkouts use `pnpm dsh ...`. A bare `dsh ...` command only works when the CLI is already on your shell `PATH`.
-- **DSH Host support policy:** DVR 3.0.x supports DSH 0.1.x continuously from `0.1.5-rc.1` (current stable evidence: `0.1.5-rc.3`) and supports the 0.2.x train from verified `0.2.0-rc.2`. Exact `0.2.1-rc.5` is also the ordinary 3.0 development Host. Pre-0.1.5 Hosts are unsupported, and DVR no longer publishes the older jagged 0.1.x exception list. Runtime behavior remains capability-based. See [DSH Host support window](docs/architecture/dsh-support-window.md).
+- **DSH Host support policy:** the zero-Provider `/vision` release requires DSH **0.2.1-rc.5** (the current development Host baseline) and supports the 0.2.x train from verified `0.2.0-rc.2`. Pre-0.1.5 Hosts are unsupported. Runtime behavior remains capability-based. See [DSH Host support window](docs/architecture/dsh-support-window.md).
 - Node ≥ 22 (host side).
 - No API key for the default free chain; a credential reference (`apiKeyEnv`) only for paid `httpProviders`.
 - Chrome / Chromium / Edge is needed only for `vision_html_screenshot`; every other tool works without a browser.
 - Desktop capture is opt-in. Windows and macOS use OS-provided capture facilities; Linux needs ImageMagick `import` or `scrot` and a capturable desktop session (Wayland support depends on the environment).
 - Tesseract is optional. `vision_ocr` defaults to `ocrEngine: auto` (local Tesseract first, vision fallback), and Settings → Advanced → **Default OCR engine** can force Tesseract-only or vision-model-only behavior without uninstalling Tesseract. An explicit per-call `engine=tesseract|vision` always overrides the default.
+
+**Hot install / upgrade at a glance** (details: [docs/architecture/p5-provider-free-contracts.md](docs/architecture/p5-provider-free-contracts.md)):
+
+| Operation | Hot, no DSH restart? | Completion evidence |
+|---|---|---|
+| Web profile first install (already-running Web) | Yes — one reload so the Host discovers the bundle | `/vision status` answers, then a real image smoke |
+| External CLI first install (`dsh plugin add`) | Yes, via the Host manifest watcher | **Not the CLI exit code** — run `/vision status` yourself |
+| Upgrade inside Web (settings one-click) | Yes | command + settings + session all verified by the card |
+| Hosts without HMR (some headless/ACP setups) | Feature-detect; plugin still loads normally on next start | honestly reported as not hot-capable |
+
+**A package-manager exit code only proves the package landed on disk.** The running Host may still be on the previous generation; always confirm with `/vision status` before assuming the new build is active.
 
 ## Install and lifecycle
 
@@ -457,7 +461,7 @@ npx @deepseek-ai/dsh --profile web --dump-config | grep vision-router
 # source checkout: pnpm dsh --profile web --dump-config | grep vision-router
 ```
 
-When first adding the plugin to an already long-lived Web profile, let that Web process reload the plugin bundle; the host discovers the browser bundle through `dsh.client` at startup. **After the plugin is loaded, model-catalog and wrapper-scope changes hot-update and do not require a restart.**
+When first adding the plugin to an already long-lived Web profile, let that Web process reload the plugin bundle; the host discovers the browser bundle through `dsh.client` at startup. **After the plugin is loaded, model-catalog and settings changes hot-update and do not require a restart.** Remember that the install command's exit code does not prove the running Host has loaded the new generation — `/vision status` does.
 
 ### Oh-DSH Desktop
 
@@ -484,7 +488,7 @@ Oh-DSH Desktop's built-in plugin marketplace (search → prepare → isolated pr
 - id: vision-router
   disabled: true
 ```
-Set it back to `false` to re-enable. Unloading removes the wrapper routes, tools, skill and settings card; cached artifact files remain.
+Set it back to `false` to re-enable. Unloading removes the tools, skill and settings card; cached artifact files remain. The zero-Provider build registers no model routes, so there is nothing extra to unload from the model directory.
 
 ### Upgrade
 

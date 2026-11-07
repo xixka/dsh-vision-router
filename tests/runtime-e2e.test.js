@@ -663,6 +663,13 @@ function bootHarness(config0 = {}) {
     resolve: async (input) => input,
     readBytes: async (target) => readFileSync(target),
   }
+  const providerTransport = {
+    async fetch(input, init) {
+      // The Router-owned egress facade: real provider legs (direct-backend
+      // rows, local backends) ride this transport, not bare fetch.
+      return fetch(input, init)
+    },
+  }
   const ctx = {
     get(name) {
       if (name === 'settings') return { get: () => undefined }
@@ -721,6 +728,7 @@ function bootHarness(config0 = {}) {
     ctx,
     toolDefs,
     registrations,
+    providerTransport,
     setSettings(next) {
       resolvedSettings = Config({ ...next })
       if (typeof settingsWatcher === 'function') settingsWatcher(resolvedSettings)
@@ -743,7 +751,7 @@ async function mountVisionScreenshot(config0) {
   return mountDeepTool({ ...config0, desktopScreenshot: true }, 'vision_screenshot')
 }
 
-test('vision-http reads local backend settings live, including URL/model/protocol changes', async () => {
+test('direct-backend rows read local backend settings live, including URL/model/protocol changes', async () => {
   const first = await startFakeOpenAI(async (req, body) => {
     assert.equal(req.url, '/v1/chat/completions')
     assert.equal(body.model, 'first-model')
@@ -759,10 +767,34 @@ test('vision-http reads local backend settings live, including URL/model/protoco
   })
   const harness = bootHarness({ freeFallback: false })
   try {
-    apply(harness.ctx, Config({ freeFallback: false }))
-    const registration = harness.registrations.get('vision-http')
-    assert.ok(registration, 'the route must exist even when no provider is enabled at apply time')
-    const adapter = registration.adapter
+    // P5: `vision-http/...` rows are direct-backend entries served by the
+    // describe walk over the provider transport. There is no adapter and no
+    // Host registration — the walk rebuilds the provider list from the LIVE
+    // settings document on every request, so backend URL/model/protocol
+    // changes take effect without a restart.
+    apply(harness.ctx, Config({ freeFallback: false }), { providerTransport: harness.providerTransport })
+    await assert.throws(
+      () => harness.ctx.llm.registration('vision-http'),
+      /no adapter registered/,
+      'vision-http must not be a Host provider anymore',
+    )
+    // The describe walk is a deep tool: mount it through vision_activate.
+    const activate = harness.toolDefs.get('vision_activate')
+    assert.ok(activate, 'progressive mode should register vision_activate')
+    await activate.execute({}, {})
+    const tool = harness.toolDefs.get('vision_describe')
+    assert.ok(tool, 'the describe walk must mount without any local backend configured')
+    // Feed deterministic image bytes for the walk's path input.
+    const originalGet = harness.ctx.get.bind(harness.ctx)
+    harness.ctx.get = (name) => (
+      name === 'fs'
+        ? { resolve: async (value) => value, readBytes: async () => PNG_BYTES }
+        : originalGet(name)
+    )
+    const runWalk = () => tool.execute(
+      { paths: ['/tmp/setting-live.png'], question: 'What is this?' },
+      { agent: { session: { id: 'settings-live-e2e', events: [] } } },
+    )
 
     harness.setSettings({
       freeFallback: false,
@@ -772,15 +804,8 @@ test('vision-http reads local backend settings live, including URL/model/protoco
         model: 'first-model',
       },
     })
-    await adapter.resolveModel('vision-http', 'local-ollama/first-model')
-    const firstChunks = []
-    for await (const chunk of adapter.stream({
-      model: 'local-ollama/first-model',
-      messages: messagesWithImages(['first']),
-    })) {
-      firstChunks.push(chunk)
-    }
-    assert.ok(firstChunks.some((chunk) => chunk.type === 'text-delta' && chunk.text === 'first settings value'))
+    let text = await runWalk()
+    assert.equal(text, 'first settings value')
     assert.equal(first.requests.length, 1)
 
     harness.setSettings({
@@ -792,19 +817,8 @@ test('vision-http reads local backend settings live, including URL/model/protoco
         format: 'anthropic',
       },
     })
-    await assert.rejects(
-      () => adapter.resolveModel('vision-http', 'local-ollama/first-model'),
-      /unknown model/,
-    )
-    await adapter.resolveModel('vision-http', 'local-lmstudio/second-model')
-    const secondChunks = []
-    for await (const chunk of adapter.stream({
-      model: 'local-lmstudio/second-model',
-      messages: messagesWithImages(['second']),
-    })) {
-      secondChunks.push(chunk)
-    }
-    assert.ok(secondChunks.some((chunk) => chunk.type === 'text-delta' && chunk.text === 'second settings value'))
+    text = await runWalk()
+    assert.equal(text, 'second settings value')
     assert.equal(first.requests.length, 1, 'disabled Ollama must not keep its stale provider snapshot')
     assert.equal(second.requests.length, 1)
   } finally {

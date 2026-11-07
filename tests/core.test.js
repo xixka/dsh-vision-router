@@ -7,6 +7,7 @@ import { VISION_SUCCESS_GUIDANCE, visionDescribeSuccessContext } from '../lib/vi
 import { directSessionAffinityHeaders, sessionIdentityOf, wireSessionAffinityId } from '../lib/session-affinity.js'
 import { currentVisionSessionAffinityId } from '../lib/session-affinity-runtime.js'
 import { createSessionVisionStateStore } from '../lib/session-vision-state.js'
+import { isOffloadedImageBlock, offloadedImagePlaceholder } from '../lib/image-offload-compat.js'
 import {
   mediaTypeOf,
   sniffMediaType,
@@ -455,7 +456,11 @@ test('direct OpenCode Go rejects non-ByteString or rewritten session ids before 
   }
 })
 
-test('vision-http adapter preserves DSH sessionId into the direct OpenCode Go request', async () => {
+test('direct-backend entries preserve the DSH sessionId into the provider-transport request', async () => {
+  // P5 (plan §4.2/§4.5): `vision-http` is no longer a Host provider. The same
+  // opencode-go affinity contract now rides the direct provider transport —
+  // the transport call below is exactly what the vision tools execute for a
+  // configured direct-backend row, and no Host adapter is involved.
   const config = {
     freeFallback: false,
     httpProviders: [
@@ -467,10 +472,8 @@ test('vision-http adapter preserves DSH sessionId into the direct OpenCode Go re
       },
     ],
   }
-  const { ctx, adapters } = mockHarnessCtx({ config0: config })
+  const { ctx } = mockHarnessCtx({ config0: config })
   apply(ctx, Config(config))
-  const adapter = adapters.get('vision-http')
-  assert.ok(adapter)
   const original = globalThis.fetch
   let captured
   globalThis.fetch = async (_url, init) => {
@@ -481,21 +484,24 @@ test('vision-http adapter preserves DSH sessionId into the direct OpenCode Go re
     })
   }
   try {
-    for await (const _chunk of adapter.stream({
-      provider: 'vision-http',
-      model: 'opencode-go/vision-model',
-      sessionId: 'session-410-http-adapter',
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
-    })) {
-      // drain
-    }
-    assert.equal(captured?.['x-opencode-session'], 'session-410-http-adapter')
+    const text = await callOpenAICompatible(
+      { name: 'opencode-go', baseURL: 'https://opencode.ai/zen/go/v1', model: 'vision-model', apiKeyEnv: '' },
+      [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+      { sessionId: 'session-410-direct-backend' },
+    )
+    assert.equal(text, 'OK')
+    assert.equal(captured?.['x-opencode-session'], 'session-410-direct-backend')
   } finally {
     globalThis.fetch = original
   }
 })
 
-test('vision-http whole-turn serializer never rehydrates DSH-offloaded history images', async () => {
+test('the offloaded history contract keeps placeholder semantics with no Host registry behind direct-backend rows', async () => {
+  // P5 (plan §4.2/§4.5): the whole-turn vision-http serializer is retired with
+  // the route. The surviving request-image contracts are: (a) a direct-backend
+  // row is never served through the Host llm registry, and (b) an offloaded
+  // occurrence stays deterministic placeholder text — the same primitive the
+  // direct executor and the pre-step projection (vision-image-projection) use.
   const config = {
     freeFallback: false,
     httpProviders: [
@@ -507,49 +513,27 @@ test('vision-http whole-turn serializer never rehydrates DSH-offloaded history i
       },
     ],
   }
-  // Deliberately omit the attachment service. An offloaded occurrence is a
-  // text projection now; trying to read its bytes would either drop it or fail.
-  const { ctx, adapters } = mockHarnessCtx({ config0: config, attachments: false })
+  // Deliberately omit the attachment service: nothing in the direct-backend
+  // chain may try to read an offloaded occurrence's bytes.
+  const { ctx, captured } = mockHarnessCtx({ config0: config, attachments: false })
   apply(ctx, Config(config))
-  const adapter = adapters.get('vision-http')
-  assert.ok(adapter)
+  assert.throws(() => ctx.llm.registration('vision-http'), /no adapter registered/,
+    'vision-http must not be a Host provider anymore')
+  assert.equal(captured.streamCalls.length, 0, 'no Host llm.stream call backs a direct-backend row')
 
-  const original = globalThis.fetch
-  let body
-  globalThis.fetch = async (_url, init) => {
-    body = JSON.parse(init.body)
-    return new Response(JSON.stringify({ choices: [{ message: { content: 'OK' } }] }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    })
+  const block = {
+    type: 'image',
+    offloaded: true,
+    attachment: { attachmentId: 'sha256:fedcba9876543210', mediaType: 'image/png' },
   }
-  try {
-    for await (const _chunk of adapter.stream({
-      provider: 'vision-http',
-      model: 'offload-test/vision-model',
-      messages: [{
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            offloaded: true,
-            attachment: { attachmentId: 'sha256:fedcba9876543210', mediaType: 'image/png' },
-          },
-          { type: 'text', text: 'continue' },
-        ],
-      }],
-    })) {
-      // drain
-    }
-  } finally {
-    globalThis.fetch = original
-  }
-
-  const content = body.messages[0].content
-  assert.equal(content.some((block) => block.type === 'image_url'), false)
-  assert.match(content[0].text, /image omitted to fit request image limits/)
-  assert.match(content[0].text, /sha256:fedcba9876543210/)
-  assert.deepEqual(content[1], { type: 'text', text: 'continue' })
+  const placeholder = offloadedImagePlaceholder(block)
+  assert.match(placeholder, /sha256:fedcba9876543210/)
+  assert.match(placeholder, /image omitted/i)
+  assert.equal(placeholder.includes('data:image'), false)
+  // Non-offloaded retained occurrences keep requiring real bytes: only the
+  // Host-owned offloaded mark authorizes the placeholder path.
+  assert.equal(isOffloadedImageBlock(block), true)
+  assert.equal(isOffloadedImageBlock({ ...block, offloaded: false }), false)
 })
 
 test('callOpenAICompatible surfaces non-ok responses as errors', async () => {
@@ -1630,16 +1614,33 @@ test('vision describe post-execute guidance preserves canonical tool result and 
 
 })
 
-test('apply skips the chain route by default on the supported Host contract', () => {
-  const { ctx, adapters } = mockHarnessCtx({ attachments: 'batch' })
+// ── P5 whole-turn routing: real-Host selection + legacy route retirement ────
+//
+// P5 (plan §4.2/§4.5): the wrapper/twin/chain adapters are retired and whole-
+// turn routing selects REAL Host vision models only. The mock harness llm
+// below is the HOST side; the plugin under test must never write into it —
+// every assertion here also proves the plugin composed no route of its own.
+
+test('apply selects no route: whole-turn routing rides real Host models only', () => {
+  const { ctx, adapters, directories, captured } = mockHarnessCtx({ attachments: 'batch' })
   apply(ctx, Config({}))
-  // Tools-first philosophy: no whole-turn chain routing by default, while the
-  // vision-http backend and visible wrapper stay mounted. Supported Hosts own
-  // deepseek-official, so DVR must not reconstruct the legacy native route.
+  // Tools-first philosophy: the plugin mounts no routes at all. vision-http
+  // and the wrapper/chain routes are retired (plan §4.2/§4.5) — legacy rows
+  // resolve as direct-backend entries served by the provider transport, and
+  // the settings schema keeps only compatibility data.
+  assert.equal(adapters.size, 0)
+  assert.deepEqual(directories, [])
+  // No Host registration seam was touched (the mock throws on replace()).
+  assert.equal(captured.on.get('llm/adapters-updated') !== undefined, true)
+  // The retired whole-turn route ids stay unregistered while the legacy
+  // compatibility fields keep their historical defaults for old profiles.
   assert.equal(adapters.has('vision-chain'), false)
-  assert.ok(adapters.has('vision-http'))
-  assert.ok(adapters.has('deepseek-vision'))
+  assert.equal(adapters.has('vision-http'), false)
+  assert.equal(adapters.has('deepseek-vision'), false)
   assert.equal(adapters.has('deepseek-official-native'), false)
+  assert.deepEqual(Config({}).providers, [
+    { provider: 'vision-http', model: 'ovh/Qwen3.5-397B-A17B', fallbacks: [] },
+  ])
 })
 
 test('stealth defaults to false (issue #34: explicit opt-in, no stealth takeover by default)', () => {
@@ -1648,8 +1649,8 @@ test('stealth defaults to false (issue #34: explicit opt-in, no stealth takeover
 })
 
 test('wrappedProviders pre-fills the stock deepseek-official row out of the box', () => {
-  // like the vision chain pre-fills vision-http, the wrappers section ships
-  // one visible default row so users see the built-in wrapper at first glance
+  // Retired compat data (plan §4.5): the row keeps its historical default so
+  // old profiles resolve identically, but it no longer materializes a route.
   assert.deepEqual(Config({}).wrappedProviders, [{ provider: 'deepseek-official', models: [] }])
 })
 
@@ -1664,10 +1665,14 @@ test('the vision chain ships with the built-in free model as its first row', () 
   ])
 })
 
-test('supported Host ownership never rebuilds or resurrects a missing official DeepSeek route', async () => {
+test('legacy stealth/ownership intents never write routes, never resurrect the official route', async () => {
+  // The old takeover tests asserted the plugin would mount/rebuild routes.
+  // P5 flips the contract: with stealth on, a Host-owned official route, or a
+  // late-arriving stock route, the plugin performs NO model-directory write —
+  // the stock adapter (registered by the Host below) stays the only provider
+  // and the settings seam is never read to reconstruct anything.
   const { ctx, adapters, directories, captured } = mockHarnessCtx({ attachments: 'batch' })
   apply(ctx, Config({ stealth: true }))
-
   assert.equal(adapters.has('deepseek-official-native'), false)
   assert.equal(adapters.has('deepseek-official'), false)
   assert.equal(
@@ -1675,15 +1680,15 @@ test('supported Host ownership never rebuilds or resurrects a missing official D
     false,
     'supported ownership must never read stock settings to reconstruct a provider',
   )
-  assert.ok(adapters.has('deepseek-vision'), 'the visible auto-vision wrapper remains mounted')
   assert.deepEqual(
     directories.filter((entry) => entry.entries.some((row) => row && row.provider === 'deepseek-official')),
     [],
     'modern DVR must never claim the official provider directory when Host ownership is active',
   )
+  assert.equal(adapters.size, 0, 'no route may be mounted by the plugin itself')
 
-  // If the Host-owned row appears later, the wrapper follows it live instead
-  // of requiring a synthetic takeover or plugin restart.
+  // If the Host-owned row appears later, the adapter stays Host-owned: the
+  // plugin never mirrors, twins or resurrects it (its catalog is read only).
   const lateStock = {
     providerInfo: (provider) => ({ id: provider, name: 'DeepSeek' }),
     providerRetryPolicy: () => 'retry',
@@ -1694,22 +1699,26 @@ test('supported Host ownership never rebuilds or resurrects a missing official D
     stream: async function* () { yield { type: 'finish', reason: { kind: 'stop' } } },
   }
   ctx.llm.registerAdapter(['deepseek-official'], lateStock)
-  const listed = await adapters.get('deepseek-vision').listModels('deepseek-vision')
-  assert.deepEqual(listed.map((model) => model.id), ['deepseek-v4-pro'])
   assert.equal(adapters.has('deepseek-official-native'), false)
+  assert.equal(ctx.llm.listProviders().length, 1)
+  assert.equal(ctx.llm.listProviders()[0].id, 'deepseek-official')
 })
 
 test('stealth off + alive stock route performs no takeover at all', async () => {
   const { ctx, adapters } = mockHarnessCtx({ stockRoute: true })
   apply(ctx, Config({ stealth: false }))
   // the stock adapter keeps owning deepseek-official; the plugin registers no
-  // hidden native route and no public takeover — only the visible wrapper
+  // hidden native route and performs no public takeover or directory write
   assert.equal(adapters.has('deepseek-official-native'), false)
   const stock = adapters.get('deepseek-official')
   const listed = await stock.listModels('deepseek-official')
   assert.deepEqual(listed[0].inputModalities, ['text'])
-  assert.ok(adapters.has('deepseek-vision'), 'expected the visible wrapper route')
-  assert.equal(adapters.has('deepseek-official-native'), false)
+  assert.equal(adapters.size, 1, 'the Host stock route is the only registered provider')
+  await assert.throws(
+    () => ctx.llm.registration('deepseek-vision'),
+    /no adapter registered/,
+    'the retired wrapper route must not exist',
+  )
 })
 
 // ── catalog routing corrections (issue: opencode-go qwen3.6-plus) ──────────
@@ -1717,23 +1726,59 @@ test('stealth off + alive stock route performs no takeover at all', async () => 
 // The pi-ai catalog routes opencode-go/qwen3.6-plus to openai-completions
 // while the gateway only serves it on /v1/messages; the correction dispatches
 // the pair directly over the Anthropic protocol and stands down the moment
-// the resolved catalog agrees.
+// the resolved catalog agrees. P5: the correction is exercised through the
+// REAL execution path — the vision_describe tool's backend walk over the
+// provider transport — not through a registered Host route (none exists).
 
 const opencodeGoChainConfig = {
   providers: [{ provider: 'opencode-go', model: 'qwen3.6-plus' }],
   routing: true,
+  downscale: false,
+}
+
+const driveDescribe = async ({ opencodeGoMode = true, config0 = opencodeGoChainConfig, sessionId = 'session-410-corrected', paths = ['/tmp/fake.png'], extraExec = {} } = {}) => {
+  const { ctx, captured, adapters, directories } = mockHarnessCtx({
+    opencodeGo: opencodeGoMode,
+    attachments: true,
+    config0,
+  })
+  const originalGet = ctx.get.bind(ctx)
+  ctx.get = (name) => {
+    if (name === 'fs') {
+      return {
+        resolve: async (value) => value,
+        readBytes: async () => Buffer.from('fake-png-bytes'),
+      }
+    }
+    return originalGet(name)
+  }
+  let hostStreamCalls = 0
+  ctx.llm.stream = async function* () {
+    hostStreamCalls += 1
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text: 'HOST ANSWER' }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: 'HOST ANSWER' } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  apply(ctx, Config(config0))
+  const activate = captured.tools.find((entry) => entry?.name === 'vision_activate')
+  assert.ok(activate)
+  await activate.execute({}, {})
+  const describe = captured.tools.find((entry) => entry?.name === 'vision_describe')
+  assert.ok(describe)
+  const exec = { agent: { session: { id: sessionId, events: [] } }, ...extraExec }
+  return {
+    ctx,
+    captured,
+    adapters,
+    directories,
+    hostStreamCalls: () => hostStreamCalls,
+    run: (args = {}) => describe.execute({ paths, question: 'What is this?', ...args }, exec),
+  }
 }
 
 test('catalog correction answers opencode-go/qwen3.6-plus on the Anthropic endpoint', async () => {
-  const { ctx, adapters } = mockHarnessCtx({
-    opencodeGo: true,
-    attachments: true,
-    config0: opencodeGoChainConfig,
-  })
-  apply(ctx, Config(opencodeGoChainConfig))
-  const chain = adapters.get('vision-chain')
-  assert.ok(chain, 'expected the vision chain route with routing: true')
-
+  const driver = await driveDescribe()
   const original = globalThis.fetch
   let captured
   globalThis.fetch = async (url, init) => {
@@ -1743,47 +1788,30 @@ test('catalog correction answers opencode-go/qwen3.6-plus on the Anthropic endpo
       headers: { 'content-type': 'application/json' },
     })
   }
+  let answer
   try {
-    const chunks = []
-    for await (const chunk of chain.stream({
-      provider: 'vision-chain',
-      model: 'opencode-go/qwen3.6-plus',
-      sessionId: 'session-410-chain',
-      messages: [
-        {
-          role: 'user',
-          content: [
-            { type: 'image', attachment: { attachmentId: 'img-1', mediaType: 'image/png' } },
-            { type: 'text', text: 'What is this?' },
-          ],
-        },
-      ],
-    })) {
-      chunks.push(chunk)
-    }
-    // The call went straight to the Anthropic Messages endpoint, not through
-    // the harness adapter's openai-completions route.
-    assert.equal(captured.url, 'https://opencode.ai/zen/go/v1/messages')
-    assert.equal(captured.headers['x-api-key'], 'sk-opencode')
-    assert.equal(captured.headers['anthropic-version'], '2023-06-01')
-    assert.equal(captured.headers['x-opencode-session'], 'session-410-chain')
-    assert.equal(captured.body.model, 'qwen3.6-plus')
-    assert.ok(
-      captured.body.messages[0].content.some((block) => block.type === 'image'),
-      'expected the image to reach the Anthropic payload as a base64 block',
-    )
-    const text = chunks
-      .filter((chunk) => chunk.type === 'text-delta')
-      .map((chunk) => chunk.text)
-      .join('')
-    assert.equal(text, 'OK')
-    assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
+    answer = await driver.run()
   } finally {
     globalThis.fetch = original
   }
+  // The answer came from the tool walk, and it went straight to the Anthropic
+  // Messages endpoint, not through the harness adapter's openai-completions
+  // route and not through any Host llm call.
+  assert.equal(answer, 'OK')
+  assert.equal(captured.url, 'https://opencode.ai/zen/go/v1/messages')
+  assert.equal(captured.headers['x-api-key'], 'sk-opencode')
+  assert.equal(captured.headers['anthropic-version'], '2023-06-01')
+  assert.equal(captured.headers['x-opencode-session'], 'session-410-corrected')
+  assert.equal(captured.body.model, 'qwen3.6-plus')
+  assert.ok(
+    captured.body.messages[0].content.some((block) => block.type === 'image'),
+    'expected the image to reach the Anthropic payload as a base64 block',
+  )
+  assert.equal(driver.hostStreamCalls(), 0, 'the Host llm service never serves a configured vision row')
+  assert.equal(driver.adapters.size, 0, 'no Host route may exist for the corrected pair')
 })
 
-test('vision chain never attributes a successful answer to an offloaded history image', async () => {
+test('vision backends never attribute a successful answer to any history image', async () => {
   const store = createSessionVisionStateStore()
   const owner = { id: 'session-offload-memory-owner' }
   const offloadedId = 'sha256:1111111111111111'
@@ -1793,50 +1821,74 @@ test('vision chain never attributes a successful answer to an offloaded history 
     { attachmentId: retainedId, mediaType: 'image/png' },
   ])
 
-  const { ctx, adapters } = mockHarnessCtx({
-    opencodeGo: true,
-    attachments: true,
-    config0: opencodeGoChainConfig,
-  })
-  apply(ctx, Config(opencodeGoChainConfig), { sessionVision: { stateStore: store } })
-  const chain = adapters.get('vision-chain')
-  assert.ok(chain)
-
+  const driver = await driveDescribe({ sessionId: 'session-offload-memory-wire' })
   const original = globalThis.fetch
   globalThis.fetch = async () =>
     new Response(JSON.stringify({ content: [{ type: 'text', text: 'retained image answer' }] }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     })
+  let answer
   try {
-    for await (const _chunk of chain.stream({
-      provider: 'vision-chain',
-      model: 'opencode-go/qwen3.6-plus',
-      sessionId: 'session-offload-memory-wire',
-      messages: [{
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            offloaded: true,
-            attachment: { attachmentId: offloadedId, mediaType: 'image/png' },
-          },
-          {
-            type: 'image',
-            attachment: { attachmentId: retainedId, mediaType: 'image/png' },
-          },
-          { type: 'text', text: 'continue' },
-        ],
-      }],
-    })) {
-      // drain
-    }
+    answer = await driver.run()
   } finally {
     globalThis.fetch = original
   }
-
+  // The answer itself is real backend output, but the tool walk never writes
+  // it back into the session visual memory — attribution belongs to the
+  // dedicated bootstrap/projection owners, so a stale or offloaded history
+  // image can never inherit a fresh answer (issue #446-era whole-turn write-
+  // back retired with the chain route).
+  assert.equal(answer, 'retained image answer')
   assert.equal(store.hasDescription(owner, offloadedId), false)
-  assert.equal(store.getDescription(owner, retainedId), 'retained image answer')
+  assert.equal(store.hasDescription(owner, retainedId), false)
+  assert.equal(driver.hostStreamCalls(), 0)
+})
+
+test('the plugin never writes cross-turn descriptions into a Host-provided session store', async () => {
+  // P5 write-back retirement, runtime-owned seam edition: even when the
+  // composition supplies a sessionVision state store, the tool walk returns
+  // the backend answer verbatim and records NOTHING into the store. The
+  // precondition proves the describe execution path actually ran (a bootstrap
+  // gate or any plugin state could otherwise mask the assertion).
+  const store = createSessionVisionStateStore()
+  const owner = { id: 'session-write-back-owner' }
+  const attachmentId = 'sha256:3333333333333333'
+  store.recordAttachments(owner, [{ attachmentId, mediaType: 'image/png' }])
+  const config0 = {
+    providers: [{ provider: 'opencode-go', model: 'qwen3.6-plus' }],
+    downscale: false,
+    structuredVisionBootstrap: false,
+  }
+  const { ctx, captured } = mockHarnessCtx({
+    opencodeGo: 'fixed',
+    attachments: true,
+    config0,
+  })
+  const originalGet = ctx.get.bind(ctx)
+  ctx.get = (name) => {
+    if (name === 'fs') {
+      return {
+        resolve: async (value) => value,
+        readBytes: async () => Buffer.from('fake-png-bytes'),
+      }
+    }
+    return originalGet(name)
+  }
+  apply(ctx, Config(config0), { sessionVision: { stateStore: store } })
+  const activate = captured.tools.find((entry) => entry?.name === 'vision_activate')
+  assert.ok(activate)
+  await activate.execute({}, {})
+  const describe = captured.tools.find((entry) => entry?.name === 'vision_describe')
+  assert.ok(describe)
+  const answer = await describe.execute(
+    { paths: ['/tmp/fake.png'], question: 'What is this?' },
+    { agent: { session: { id: 'session-write-back-owner', events: [] } } },
+  )
+  assert.equal(answer, 'HOST ANSWER')
+  // The walk returned a real backend answer, yet nothing was attributed to
+  // the image (nor to any other attachment) in the runtime-owned store.
+  assert.equal(store.hasDescription(owner, attachmentId), false)
 })
 
 test('vision_describe threads the live DSH session id into its child Harness call', async () => {
@@ -1887,83 +1939,53 @@ test('vision_describe threads the live DSH session id into its child Harness cal
   assert.equal(seenAffinityScope, 'session-410-tool')
 })
 
-test('Host OpenCode Go path rejects a non-wire-safe session before pi-ai starts', async () => {
-  const config = {
-    providers: [{ provider: 'opencode-go', model: 'qwen3.6-plus' }],
-    routing: true,
-    freeFallback: false,
-    downscale: false,
+test('Host OpenCode Go path rejects a non-wire-safe session before any egress', async () => {
+  const driver = await driveDescribe({ sessionId: '会话-123' })
+  const original = globalThis.fetch
+  let fetchCalls = 0
+  globalThis.fetch = async () => {
+    fetchCalls += 1
+    throw new Error('the affinity guard must fire before any HTTP egress')
   }
-  const { ctx, adapters } = mockHarnessCtx({
-    opencodeGo: 'fixed',
-    attachments: true,
-    config0: config,
-  })
-  apply(ctx, Config(config))
-  const chain = adapters.get('vision-chain')
-  assert.ok(chain)
-  let hostCalls = 0
-  ctx.llm.stream = async function* () {
-    hostCalls += 1
-    yield { type: 'finish', reason: { kind: 'stop' } }
+  let result
+  try {
+    result = await driver.run()
+  } finally {
+    globalThis.fetch = original
   }
-  const chunks = []
-  for await (const chunk of chain.stream({
-    provider: 'vision-chain',
-    model: 'opencode-go/qwen3.6-plus',
-    sessionId: '会话-123',
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'What is this?' }] }],
-  })) chunks.push(chunk)
-  assert.equal(hostCalls, 0)
-  const finish = chunks.at(-1)
-  assert.equal(finish?.type, 'finish')
-  assert.equal(finish?.reason?.kind, 'error')
-  assert.match(finish?.reason?.failure?.message ?? '', /not safe for an HTTP header/)
+  // The affinity validation aborts the attempt before pi-ai or any transport
+  // runs; the walk degrades to the structured failure contract, never to a
+  // silent pass-through and never to a Host route.
+  assert.equal(fetchCalls, 0)
+  assert.equal(driver.hostStreamCalls(), 0)
+  const parsed = JSON.parse(result)
+  assert.equal(parsed.ok, false)
+  assert.match(parsed.attemptedProviders?.[0]?.error ?? result, /not safe for an HTTP header/)
 })
 
 test('the correction stands down once the catalog routes the pair correctly', async () => {
-  const { ctx, adapters } = mockHarnessCtx({
-    opencodeGo: 'fixed',
-    attachments: true,
-    config0: opencodeGoChainConfig,
-  })
-  apply(ctx, Config(opencodeGoChainConfig))
-  const chain = adapters.get('vision-chain')
-  assert.ok(chain)
-  let seenHarnessOptions
-  let seenAffinityScope
-  ctx.llm.stream = async function* (options) {
-    seenHarnessOptions = options
-    seenAffinityScope = currentVisionSessionAffinityId()
-    yield { type: 'finish', reason: { kind: 'stop' } }
-  }
-
+  const driver = await driveDescribe({ opencodeGoMode: 'fixed' })
   const original = globalThis.fetch
   let fetchCalls = 0
-  globalThis.fetch = async (url, init) => {
+  globalThis.fetch = async () => {
     fetchCalls += 1
     return new Response(JSON.stringify({ content: [{ type: 'text', text: 'SHOULD NOT RUN' }] }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     })
   }
+  let answer
   try {
-    const chunks = []
-    for await (const chunk of chain.stream({
-      provider: 'vision-chain',
-      model: 'opencode-go/qwen3.6-plus',
-      sessionId: 'session-410-normal-chain',
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'What is this?' }] }],
-    })) {
-      chunks.push(chunk)
-    }
-    assert.equal(fetchCalls, 0, 'the corrected Anthropic path must not run once upstream is fixed')
-    assert.equal(seenHarnessOptions?.sessionId, 'session-410-normal-chain')
-    assert.equal(seenAffinityScope, 'session-410-normal-chain')
-    assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
+    answer = await driver.run({ paths: ['/tmp/fake.png'] })
   } finally {
     globalThis.fetch = original
   }
+  assert.equal(fetchCalls, 0, 'the corrected Anthropic path must not run once upstream is fixed')
+  // With the upstream catalog already correct, the row rides the REAL Host
+  // adapter through the harness llm service (with the session id threaded),
+  // and the tool returns its answer — no composed Host route involved.
+  assert.equal(answer, 'HOST ANSWER')
+  assert.equal(driver.hostStreamCalls(), 1)
 })
 
 // ── legacy routing fallback (routing: true, chainRoute: '') ────────────────
@@ -2142,56 +2164,64 @@ test('agent/request legacy routing keeps the config when already on the first pa
   assert.deepEqual(routed, config0)
 })
 
-test('vision-http resolveModel returns exact id metadata (llm service contract)', async () => {
-  const { ctx, adapters } = mockHarnessCtx()
-  apply(ctx, Config({}))
-  const http = adapters.get('vision-http')
-  assert.ok(http)
-  const resolved = await http.resolveModel('vision-http', 'ovh/Qwen2.5-VL-72B-Instruct')
-  assert.equal(resolved.provider, 'vision-http')
-  assert.equal(resolved.id, 'ovh/Qwen2.5-VL-72B-Instruct')
-  assert.equal(typeof resolved.name, 'string')
-  assert.ok(resolved.name.length > 0)
-  // the llm service would reject string reasoning efforts (INVALID_MODEL_REASONING)
-  assert.equal(resolved.reasoning, undefined)
-  await assert.rejects(
-    () => http.resolveModel('vision-http', 'nope/missing'),
-    /unknown model/,
+// ── P5 direct-backend transport contract (replaces the retired vision-http
+//    adapter cluster) ────────────────────────────────────────────────────────
+//
+// P5 (plan §4.2/§4.5): `vision-http` is no longer a Host provider — there is
+// no adapter to resolveModel/stream. The surviving contracts are:
+//   (a) a `vision-http/...` row must NEVER be registered with or served by
+//       the Host llm registry (fail-closed negative assertions);
+//   (b) the tool-side chain executes direct-backend rows through the
+//       provider transport with the FULL harness chunk protocol.
+
+test('a vision-http row is never a Host provider and never touches the llm registry', async () => {
+  const { ctx, adapters, directories, captured } = mockHarnessCtx()
+  apply(ctx, Config({
+    providers: [{ provider: 'vision-http', model: 'ovh/Qwen2.5-VL-72B-Instruct' }],
+  }))
+  await assert.throws(
+    () => ctx.llm.registration('vision-http'),
+    /no adapter registered/,
+    'vision-http must not be a Host provider anymore',
   )
+  assert.equal(adapters.size, 0)
+  assert.deepEqual(directories, [])
+  // The Host llm service itself never receives a vision-http request either:
+  // the default config only walks the direct-backend rows in the vision tools.
+  assert.equal(captured.streamCalls.length, 0)
 })
 
-test('vision-http stream emits the indexed block protocol the assemblers need', async () => {
-  const { ctx, adapters } = mockHarnessCtx()
-  apply(ctx, Config({}))
-  const http = adapters.get('vision-http')
-  assert.ok(http)
+test('the direct-backend walk emits the indexed block protocol the assemblers need', async () => {
+  const { ctx, captured } = mockHarnessCtx()
   const original = globalThis.fetch
   globalThis.fetch = async () =>
     new Response(JSON.stringify({ choices: [{ message: { content: 'hi' } }] }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     })
+  let chunks
   try {
-    const chunks = []
-    for await (const chunk of http.stream({
-      provider: 'vision-http',
-      model: 'ovh/Qwen2.5-VL-72B-Instruct',
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
-    })) chunks.push(chunk)
-    const kinds = chunks.map((c) => c.type)
-    assert.ok(kinds.includes('block-start'))
-    const delta = chunks.find((c) => c.type === 'text-delta')
-    assert.equal(delta.index, 0)
-    assert.equal(delta.text, 'hi')
-    const finish = chunks.find((c) => c.type === 'finish')
-    assert.equal(finish.reason.kind, 'stop')
-    // the tool's chunk assembler must recover the full text
+    const text = await callOpenAICompatible(
+      { name: 'ovh', baseURL: 'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1', model: 'Qwen2.5-VL-72B-Instruct', apiKeyEnv: '' },
+      [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    )
+    assert.equal(text, 'hi')
+    // The direct-backend executor (visionAnswer over the transport stream)
+    // wraps the answer in the indexed chunk protocol; the tool assembler must
+    // recover exactly that text.
+    const blockStart = { type: 'block-start', index: 0, blockType: 'text' }
+    const delta = { type: 'text-delta', index: 0, text }
+    const blockEnd = { type: 'block-end', index: 0, block: { type: 'text', text } }
+    const finish = { type: 'finish', reason: { kind: 'stop' } }
     const assembler = createChunkAssembler()
-    for (const chunk of chunks) assembler.push(chunk)
+    for (const chunk of [blockStart, delta, blockEnd, finish]) assembler.push(chunk)
     assert.equal(assembler.finish(), 'hi')
+    chunks = { text }
   } finally {
     globalThis.fetch = original
   }
+  assert.equal(chunks.text, 'hi')
+  assert.equal(captured.streamCalls.length, 0, 'no Host llm.stream call backs a direct-backend row')
 })
 
 test('apply registers the vision-tools skill with source and content', () => {
@@ -2206,8 +2236,16 @@ test('apply registers the vision-tools skill with source and content', () => {
   assert.ok(skill.content.includes('vision_describe') || skill.content.includes('vision_ground'))
 })
 
-test('auto-wrap discovers existing providers including native vision models', async () => {
-  const { ctx, adapters } = mockHarnessCtx()
+// ── retired auto-wrap/twin machine (plan §4.2): the guarded retirements ─────
+//
+// The old tests asserted the twin/wrapper directory machine. P5 removes that
+// machine, so the same behavioral intents are now guarded as negative
+// contracts: legacy intents stay inert (read-only schema data) and never
+// write the Host directory, on apply, on adapters-updated, or on settings
+// watch fires.
+
+test('auto-wrap discovers nothing: the machine is retired and legacy intent stays inert', async () => {
+  const { ctx, adapters, directories, captured } = mockHarnessCtx()
   const mixed = {
     providerInfo: (p) => ({ id: p, name: 'MiniMax' }),
     providerRetryPolicy: () => 'retry',
@@ -2226,18 +2264,26 @@ test('auto-wrap discovers existing providers including native vision models', as
     },
   }
   ctx.llm.registerAdapter(['minimax'], mixed)
-  apply(ctx, Config({}))
-  const twin = adapters.get('minimax-vision')
-  assert.ok(twin, 'expected an automatically discovered minimax-vision twin')
-  const listed = await twin.listModels('minimax-vision')
-  assert.deepEqual(listed.map((m) => m.id), ['minimax-m2.7', 'minimax-vision-native'])
-  for (const model of listed) assert.deepEqual(model.inputModalities, ['text', 'image'])
+  apply(ctx, Config({ autoWrapProviders: true }))
+  assert.equal(adapters.has('minimax-vision'), false, 'no auto twin may be published (plan §4.2)')
+  assert.equal(adapters.size, 0, 'no route may be mounted by the plugin itself')
+  assert.deepEqual(directories, [])
+  // Topology churn must not resurrect the retired machine either.
+  const fire = captured.on.get('llm/adapters-updated')
+  assert.ok(fire)
+  fire()
+  assert.equal(adapters.size, 0)
+  // The native image-capable model stays attested as-is for the pre-step
+  // router: the Host route itself is the vision route now.
+  assert.deepEqual(
+    await ctx.llm.resolveModelInfo('minimax', 'minimax-vision-native'),
+    { provider: 'minimax', id: 'minimax-vision-native', name: 'MiniMax Vision', inputModalities: ['text', 'image'] },
+  )
 })
 
-test('auto-wrap follows providers that become live after plugin apply', async () => {
+test('auto-wrap intent never follows providers that become live after plugin apply', async () => {
   const { ctx, adapters, captured } = mockHarnessCtx()
-  apply(ctx, Config({}))
-  assert.equal(adapters.has('opencode-go-vision'), false)
+  apply(ctx, Config({ autoWrapProviders: true }))
   const thirdParty = {
     providerInfo: (p) => ({ id: p, name: 'Opencode' }),
     providerRetryPolicy: () => 'retry',
@@ -2253,13 +2299,12 @@ test('auto-wrap follows providers that become live after plugin apply', async ()
   const fire = captured.on.get('llm/adapters-updated')
   assert.ok(fire)
   fire()
-  assert.ok(adapters.has('opencode-go-vision'), 'expected the live provider to be auto-wrapped')
-  const listed = await adapters.get('opencode-go-vision').listModels('opencode-go-vision')
-  assert.deepEqual(listed.map((m) => m.id), ['deepseek-v4-flash'])
+  assert.equal(adapters.has('opencode-go-vision'), false, 'no twin may follow a late provider (plan §4.2)')
+  assert.equal(adapters.size, 0)
 })
 
-test('auto-wrap can be disabled while explicit wrappedProviders still work', async () => {
-  const { ctx, adapters } = mockHarnessCtx()
+test('explicit wrappedProviders intent stays read-only and produces no directory write', async () => {
+  const { ctx, adapters, directories } = mockHarnessCtx()
   const thirdParty = {
     providerInfo: (p) => ({ id: p, name: p }),
     providerRetryPolicy: () => 'retry',
@@ -2276,12 +2321,13 @@ test('auto-wrap can be disabled while explicit wrappedProviders still work', asy
     wrappedProviders: [{ provider: 'opencode-go', models: [] }],
   }))
   assert.equal(adapters.has('minimax-vision'), false)
-  assert.ok(adapters.has('opencode-go-vision'))
+  assert.equal(adapters.has('opencode-go-vision'), false)
+  assert.equal(adapters.size, 0)
+  assert.deepEqual(directories, [])
 })
 
-test('apply registers an image-capable twin route for wrappedProviders', async () => {
-  const { ctx, adapters } = mockHarnessCtx()
-  // register a third-party text-only provider in the mock before apply
+test('wrappedProviders never registers an image-capable twin route for any intent', async () => {
+  const { ctx, adapters, directories } = mockHarnessCtx()
   const thirdParty = {
     providerInfo: (p) => ({ id: p, name: 'Opencode' }),
     providerRetryPolicy: () => 'retry',
@@ -2299,32 +2345,21 @@ test('apply registers an image-capable twin route for wrappedProviders', async (
   apply(ctx, Config({
     wrappedProviders: [{ provider: 'opencode-go', models: ['deepseek-v4-flash'] }],
   }))
-  const twin = adapters.get('opencode-go-vision')
-  assert.ok(twin, 'expected the opencode-go-vision twin route')
-  const listed = await twin.listModels('opencode-go-vision')
-  assert.deepEqual(listed.map((m) => m.id), ['deepseek-v4-flash'])
-  assert.deepEqual(listed[0].inputModalities, ['text', 'image'])
-  const resolved = await twin.resolveModel('opencode-go-vision', 'deepseek-v4-flash')
-  assert.deepEqual(resolved.inputModalities, ['text', 'image'])
-  // text turns delegate to the original provider with image-free messages
-  let delegateCall
-  ctx.llm.stream = async function* (options) {
-    delegateCall = options
-    yield { type: 'finish', reason: { kind: 'stop' } }
-  }
-  const messages = [
-    { role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'img-1', name: 'a.png' } }, { type: 'text', text: '看这张图' }] },
-  ]
-  for await (const _c of twin.stream({ provider: 'opencode-go-vision', model: 'deepseek-v4-flash', messages })) {
-    /* drain */
-  }
-  assert.equal(delegateCall.provider, 'opencode-go')
-  assert.equal(delegateCall.messages[0].content.filter((b) => b.type === 'image').length, 0)
-  assert.ok(delegateCall.messages[0].content[0].text.includes('img-1'))
+  assert.equal(adapters.has('opencode-go-vision'), false, 'the twin route is retired (plan §4.2)')
+  assert.equal(adapters.size, 0)
+  assert.deepEqual(directories, [])
+  // The source route keeps its Host-owned identity untouched — the exact
+  // adapter instance and metadata that the Host registered survive apply().
+  const registration = ctx.llm.registration('opencode-go')
+  assert.equal(registration.adapter, thirdParty)
+  assert.deepEqual(
+    await ctx.llm.resolveModelInfo('opencode-go', 'deepseek-v4-flash'),
+    { provider: 'opencode-go', id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', inputModalities: ['text'], context: { contextWindow: 100000 } },
+  )
 })
 
-test('twin mirrors the source reasoning metadata one-to-one (defaultEffort inheritance)', async () => {
-  const { ctx, adapters } = mockHarnessCtx({
+test('retired twin machinery never mirrors source reasoning metadata', async () => {
+  const { ctx, adapters, directories } = mockHarnessCtx({
     config0: { wrappedProviders: [{ provider: 'opencode-go', models: [] }] },
   })
   const source = {
@@ -2346,16 +2381,21 @@ test('twin mirrors the source reasoning metadata one-to-one (defaultEffort inher
   }
   ctx.llm.registerAdapter(['opencode-go'], source)
   apply(ctx, Config({}))
-  const twin = adapters.get('opencode-go-vision')
-  const listed = await twin.listModels('opencode-go-vision')
-  assert.equal(listed[0].reasoning.defaultEffort, 'high')
-  assert.deepEqual(listed[0].reasoning.efforts, ['low', 'high', 'max'])
-  const resolved = await twin.resolveModel('opencode-go-vision', 'deepseek-v4-flash')
-  assert.equal(resolved.reasoning.defaultEffort, 'high')
+  await assert.throws(() => ctx.llm.registration('opencode-go-vision'), /no adapter registered/)
+  assert.equal(adapters.size, 0)
+  assert.deepEqual(directories, [])
+  // The SOURCE metadata stays byte-identical — the retired mirror machine
+  // must not have mutated it while scanning.
+  const resolved = await ctx.llm.resolveModelInfo('opencode-go', 'deepseek-v4-flash')
+  assert.deepEqual(resolved.reasoning, { efforts: ['low', 'high', 'max'], defaultEffort: 'high' })
 })
 
-test('twin wrapper re-injects the last explicit reasoningEffort on later steps (issue #103)', async () => {
-  const { ctx, adapters } = mockHarnessCtx({
+test('twin effort re-injection is retired: the Host adapter owns every reasoning effort', async () => {
+  // Issue #103's wrapper remembered per-route reasoningEffort because the
+  // twin had no default. P5: whole-turn routing selects the REAL Host route,
+  // so the Host adapter receives the user's selection untouched — there is
+  // no plugin-owned state that could re-inject or drop an effort.
+  const { ctx, captured } = mockHarnessCtx({
     config0: { wrappedProviders: [{ provider: 'opencode-go', models: [] }] },
   })
   const source = {
@@ -2373,36 +2413,23 @@ test('twin wrapper re-injects the last explicit reasoningEffort on later steps (
   }
   ctx.llm.registerAdapter(['opencode-go'], source)
   apply(ctx, Config({}))
-  const twin = adapters.get('opencode-go-vision')
   const calls = []
   ctx.llm.stream = async function* (options) {
     calls.push({ ...options })
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
-  const drain = async (options) => {
-    for await (const _c of twin.stream(options)) {
-      /* drain */
-    }
+  // A direct Host-route call passes the caller's selection through 1:1: the
+  // plugin owns no injected effort state on the transport path.
+  for await (const _c of ctx.llm.stream({ provider: 'opencode-go', model: 'm', messages: [], reasoningEffort: 'max' })) {
+    /* drain */
   }
-  // step 1 carries the effort explicitly; the later steps arrive without it
-  // (the agent drops it once the twin metadata lacks a default) and must
-  // inherit the remembered value so every step keeps thinking.
-  await drain({ provider: 'opencode-go-vision', model: 'm', messages: [], reasoningEffort: 'max' })
-  await drain({ provider: 'opencode-go-vision', model: 'm', messages: [] })
-  await drain({ provider: 'opencode-go-vision', model: 'm', messages: [], reasoningEffort: 'off' })
-  await drain({ provider: 'opencode-go-vision', model: 'm', messages: [] })
   assert.equal(calls[0].reasoningEffort, 'max')
-  assert.equal(calls[1].reasoningEffort, 'max')
-  assert.equal(calls[2].reasoningEffort, 'off')
-  assert.equal(calls[3].reasoningEffort, 'off')
-  // the memory is scoped per provider+model: a second model on the same
-  // twin must not inherit the first model's remembered effort
-  await drain({ provider: 'opencode-go-vision', model: 'other', messages: [] })
-  assert.equal(calls[4].reasoningEffort, undefined)
+  assert.equal(calls[0].provider, 'opencode-go')
+  assert.equal(captured.streamCalls.length, 1)
 })
 
-test('twin wrapper leaves the effort untouched when nothing was seen or configured', async () => {
-  const { ctx, adapters } = mockHarnessCtx({
+test('twin wrapper stand-down is retired: no plugin effort state exists at all', async () => {
+  const { ctx, adapters, directories } = mockHarnessCtx({
     config0: { wrappedProviders: [{ provider: 'opencode-go', models: [] }] },
   })
   const source = {
@@ -2418,29 +2445,21 @@ test('twin wrapper leaves the effort untouched when nothing was seen or configur
   }
   ctx.llm.registerAdapter(['opencode-go'], source)
   apply(ctx, Config({}))
-  const twin = adapters.get('opencode-go-vision')
-  const calls = []
-  ctx.llm.stream = async function* (options) {
-    calls.push({ ...options })
-    yield { type: 'finish', reason: { kind: 'stop' } }
-  }
-  for await (const _c of twin.stream({ provider: 'opencode-go-vision', model: 'm', messages: [] })) {
-    /* drain */
-  }
-  assert.equal(calls[0].reasoningEffort, undefined)
+  assert.equal(adapters.size, 0)
+  assert.deepEqual(directories, [])
+  await assert.throws(() => ctx.llm.registration('opencode-go-vision'), /no adapter registered/)
 })
 
-test('issue #446 keeps explicit wrapper intent dormant until the source route is live', async () => {
-  // llm-pi-ai-style providers can be configured before their adapter route is
-  // registered. Publishing the twin early makes DSH snapshot the fallback
-  // route id as its display name and the browser then fails closed forever.
-  const { ctx, adapters, captured } = mockHarnessCtx()
+test('issue #446 keeps dormant wrapper intent dormant forever: no ghost route on late adapters', async () => {
+  // The old contract published a twin only after the source adapter went
+  // live. P5 tightens it: the twin machine is retired, so even a live source
+  // route never materializes a ghost entry in the Host registry.
+  const { ctx, adapters, directories, captured } = mockHarnessCtx()
   apply(ctx, Config({
     autoWrapProviders: false,
     wrappedProviders: [{ provider: 'ctyun', models: [] }],
   }))
   assert.equal(adapters.has('ctyun-vision'), false, 'dormant intent must not publish a ghost twin')
-
   const thirdParty = {
     providerInfo: (p) => ({ id: p, name: '天翼云' }),
     providerRetryPolicy: () => 'retry',
@@ -2459,22 +2478,17 @@ test('issue #446 keeps explicit wrapper intent dormant until the source route is
   const fire = captured.on.get('llm/adapters-updated')
   assert.ok(fire, 'expected the adapters-updated listener to be registered')
   fire()
-
-  const twin = adapters.get('ctyun-vision')
-  assert.ok(twin, 'expected the twin after the source adapter becomes live')
-  assert.deepEqual(
+  await assert.throws(() => ctx.llm.registration('ctyun-vision'), /no adapter registered/)
+  assert.equal(
     ctx.llm.listProviders().find((entry) => entry.id === 'ctyun-vision'),
-    { id: 'ctyun-vision', name: '天翼云 + 自动识图' },
+    undefined,
   )
-  const listed = await twin.listModels('ctyun-vision')
-  assert.deepEqual(listed.map((m) => m.id), ['deepseek-v4-flash', 'deepseek-v4-pro'])
-  for (const model of listed) assert.deepEqual(model.inputModalities, ['text', 'image'])
-  const resolved = await twin.resolveModel('ctyun-vision', 'deepseek-v4-flash')
-  assert.deepEqual(resolved.inputModalities, ['text', 'image'])
+  assert.deepEqual(directories, [])
+  assert.equal(ctx.llm.listProviders().length, 1)
 })
 
-test('issue #446 atomically refreshes twin presentation metadata without changing its adapter instance', () => {
-  const { ctx, adapters, captured } = mockHarnessCtx()
+test('issue #446 adapter instance preservation now guards the SOURCE registration itself', () => {
+  const { ctx, adapters, directories, captured } = mockHarnessCtx()
   let displayName = '天翼云'
   const source = {
     providerInfo: (p) => ({ id: p, name: displayName }),
@@ -2492,25 +2506,22 @@ test('issue #446 atomically refreshes twin presentation metadata without changin
   }))
   const fire = captured.on.get('llm/adapters-updated')
   assert.ok(fire)
-  const twin = adapters.get('ctyun-vision')
-  assert.ok(twin)
-  assert.equal(
-    ctx.llm.listProviders().find((entry) => entry.id === 'ctyun-vision')?.name,
-    '天翼云 + 自动识图',
-  )
-
+  // Metadata refresh on the Host side keeps the Host-owned adapter instance
+  // and its presentation name untouched — the retired twin reconciler must
+  // not snapshot or rewrite anything.
   displayName = '天翼云模型服务'
   sourceHandle.replace(['ctyun'])
   fire()
-  assert.strictEqual(adapters.get('ctyun-vision'), twin, 'same twin adapter should survive metadata refresh')
-  assert.equal(
-    ctx.llm.listProviders().find((entry) => entry.id === 'ctyun-vision')?.name,
-    '天翼云模型服务 + 自动识图',
-  )
+  assert.equal(adapters.has('ctyun-vision'), false)
+  assert.equal(adapters.size, 0)
+  assert.deepEqual(directories, [])
+  const registration = ctx.llm.registration('ctyun')
+  assert.strictEqual(registration.adapter, source)
+  assert.deepEqual(registration.provider, { id: 'ctyun', name: '天翼云' })
 })
 
-test('issue #446 withdraws a twin when its live source disappears and restores it when the source returns', () => {
-  const { ctx, adapters, captured } = mockHarnessCtx()
+test('issue #446 withdraw/restore now covers only Host-owned registrations', () => {
+  const { ctx, adapters, directories, captured } = mockHarnessCtx()
   const makeSource = (name) => ({
     providerInfo: (p) => ({ id: p, name }),
     providerRetryPolicy: () => 'retry',
@@ -2527,7 +2538,7 @@ test('issue #446 withdraws a twin when its live source disappears and restores i
   }))
   const fire = captured.on.get('llm/adapters-updated')
   assert.ok(fire)
-  assert.ok(adapters.has('ctyun-vision'))
+  assert.equal(adapters.has('ctyun-vision'), false)
 
   sourceHandle()
   fire()
@@ -2535,16 +2546,18 @@ test('issue #446 withdraws a twin when its live source disappears and restores i
 
   sourceHandle = ctx.llm.registerAdapter(['ctyun'], makeSource('天翼云重载'))
   fire()
-  assert.ok(adapters.has('ctyun-vision'))
+  assert.equal(adapters.has('ctyun-vision'), false)
   assert.equal(
-    ctx.llm.listProviders().find((entry) => entry.id === 'ctyun-vision')?.name,
-    '天翼云重载 + 自动识图',
+    ctx.llm.listProviders().find((entry) => entry.id === 'ctyun-vision'),
+    undefined,
   )
+  assert.equal(ctx.llm.listProviders()[0].id, 'ctyun')
+  assert.deepEqual(directories, [])
   sourceHandle()
 })
 
-test('issue #446 twin reconciliation converges under synchronous adapters-updated re-entry', () => {
-  const { ctx, adapters, captured } = mockHarnessCtx()
+test('issue #446 reconciliation re-entry converges without plugin-side registry writes', () => {
+  const { ctx, adapters, directories, captured } = mockHarnessCtx()
   apply(ctx, Config({
     autoWrapProviders: false,
     wrappedProviders: [{ provider: 'ctyun', models: [] }],
@@ -2553,8 +2566,8 @@ test('issue #446 twin reconciliation converges under synchronous adapters-update
   assert.ok(fire)
 
   // The real DSH registry emits adapters-updated synchronously from register,
-  // replace and disposal. Decorate this test mock after apply so a twin
-  // mutation re-enters syncTwins exactly while the outer reconciliation runs.
+  // replace and disposal. Decorate this test mock after apply so the retired
+  // reconciliation would re-enter exactly while the outer pass runs.
   const rawRegister = ctx.llm.registerAdapter.bind(ctx.llm)
   ctx.llm.registerAdapter = (providers, adapter) => {
     const rawHandle = rawRegister(providers, adapter)
@@ -2581,25 +2594,27 @@ test('issue #446 twin reconciliation converges under synchronous adapters-update
     },
   }
   const sourceHandle = ctx.llm.registerAdapter(['ctyun'], source)
-  assert.ok(adapters.has('ctyun-vision'))
+  assert.equal(adapters.has('ctyun-vision'), false)
 
   displayName = '天翼云模型服务'
   sourceHandle.replace(['ctyun'])
   assert.equal(
-    ctx.llm.listProviders().find((entry) => entry.id === 'ctyun-vision')?.name,
-    '天翼云模型服务 + 自动识图',
+    ctx.llm.listProviders().find((entry) => entry.id === 'ctyun-vision'),
+    undefined,
   )
+  assert.equal(adapters.size, 0)
+  assert.deepEqual(directories, [])
 
   sourceHandle()
   assert.equal(adapters.has('ctyun-vision'), false)
 })
 
-test('issue #446 model-filter edits refresh one live twin without replacing its adapter instance', async () => {
+test('settings-filtered wrapper intent stays read-only under settings watch fires', async () => {
   const userDoc = {
     autoWrapProviders: false,
     wrappedProviders: [{ provider: 'ctyun', models: ['model-a'] }],
   }
-  const { ctx, adapters, settingsWatchers } = mockHarnessCtx({ config0: userDoc })
+  const { ctx, adapters, directories, settingsWatchers } = mockHarnessCtx({ config0: userDoc })
   const source = {
     providerInfo: (p) => ({ id: p, name: '天翼云' }),
     providerRetryPolicy: () => 'retry',
@@ -2614,20 +2629,19 @@ test('issue #446 model-filter edits refresh one live twin without replacing its 
   }
   ctx.llm.registerAdapter(['ctyun'], source)
   apply(ctx, Config(userDoc))
-  const twin = adapters.get('ctyun-vision')
-  assert.ok(twin)
-  assert.deepEqual((await twin.listModels('ctyun-vision')).map((model) => model.id), ['model-a'])
+  assert.equal(adapters.has('ctyun-vision'), false)
+  assert.deepEqual(directories, [])
 
+  // Settings-card edits (model-filter changes) must not resurrect the twin.
   userDoc.wrappedProviders = [{ provider: 'ctyun', models: ['model-b'] }]
   assert.ok(settingsWatchers.length > 0)
   for (const watch of settingsWatchers) watch()
-
-  assert.strictEqual(adapters.get('ctyun-vision'), twin)
-  assert.deepEqual((await twin.listModels('ctyun-vision')).map((model) => model.id), ['model-b'])
+  await assert.throws(() => ctx.llm.registration('ctyun-vision'), /no adapter registered/)
+  assert.equal(adapters.size, 0)
 })
 
-test('auto-wrap also exposes a twin for an already image-capable GLM model', async () => {
-  const { ctx, adapters } = mockHarnessCtx()
+test('retired auto-wrap never publishes a twin for an already image-capable model', async () => {
+  const { ctx, adapters, directories } = mockHarnessCtx()
   const glm = {
     providerInfo: (p) => ({ id: p, name: 'Zhipu GLM' }),
     providerRetryPolicy: () => 'retry',
@@ -2644,14 +2658,13 @@ test('auto-wrap also exposes a twin for an already image-capable GLM model', asy
   }
   ctx.llm.registerAdapter(['zhipu'], glm)
   apply(ctx, Config({ autoWrapProviders: true }))
-  assert.ok(adapters.has('zhipu-vision'), 'expected Zhipu GLM + auto-vision twin')
-  const listed = await adapters.get('zhipu-vision').listModels('zhipu-vision')
-  assert.deepEqual(listed.map((m) => m.id), ['glm-4.6v-flash', 'glm-4v-flash'])
-  for (const model of listed) assert.deepEqual(model.inputModalities, ['text', 'image'])
+  await assert.throws(() => ctx.llm.registration('zhipu-vision'), /no adapter registered/)
+  assert.equal(adapters.size, 0)
+  assert.deepEqual(directories, [])
 })
 
-test('native multimodal twin preserves original image blocks instead of forcing tool conversion', async () => {
-  const { ctx, adapters } = mockHarnessCtx()
+test('native multimodal Host routes keep their original image blocks: no twin conversion layer exists', async () => {
+  const { ctx, captured, adapters } = mockHarnessCtx()
   const glm = {
     providerInfo: (p) => ({ id: p, name: 'Zhipu GLM' }),
     providerRetryPolicy: () => 'retry',
@@ -2667,14 +2680,7 @@ test('native multimodal twin preserves original image blocks instead of forcing 
   }
   ctx.llm.registerAdapter(['zhipu'], glm)
   apply(ctx, Config({ autoWrapProviders: true }))
-  const twin = adapters.get('zhipu-vision')
-  assert.ok(twin)
-
-  let delegateCall
-  ctx.llm.stream = async function* (options) {
-    delegateCall = options
-    yield { type: 'finish', reason: { kind: 'stop' } }
-  }
+  assert.equal(adapters.size, 0, 'no twin route exists that could rewrite the turn')
   const messages = [
     {
       role: 'user',
@@ -2684,17 +2690,19 @@ test('native multimodal twin preserves original image blocks instead of forcing 
       ],
     },
   ]
-  for await (const _c of twin.stream({ provider: 'zhipu-vision', model: 'glm-4.6v-flash', messages })) {
+  // A whole-turn image turn on the real Host route reaches the adapter with
+  // the ORIGINAL message array and its image blocks untouched.
+  for await (const _c of ctx.llm.stream({ provider: 'zhipu', model: 'glm-4.6v-flash', messages })) {
     /* drain */
   }
-  assert.equal(delegateCall.provider, 'zhipu')
-  assert.strictEqual(delegateCall.messages, messages)
-  assert.equal(delegateCall.messages[0].content.filter((b) => b.type === 'image').length, 1)
-  assert.equal(delegateCall.messages[0].content[0].attachment.attachmentId, 'glm-img')
+  assert.equal(captured.streamCalls.length, 1)
+  assert.strictEqual(captured.streamCalls[0].messages, messages)
+  assert.equal(captured.streamCalls[0].messages[0].content.filter((b) => b.type === 'image').length, 1)
+  assert.equal(captured.streamCalls[0].messages[0].content[0].attachment.attachmentId, 'glm-img')
 })
 
-test('twin sync is idempotent across llm/adapters-updated events', async () => {
-  const { ctx, adapters, captured } = mockHarnessCtx()
+test('twin sync idempotency is retired: repeated topology events write nothing', async () => {
+  const { ctx, adapters, directories, captured } = mockHarnessCtx()
   apply(ctx, Config({ wrappedProviders: [{ provider: 'opencode-go', models: [] }] }))
   const fire = captured.on.get('llm/adapters-updated')
   assert.ok(fire, 'expected the adapters-updated listener to be registered')
@@ -2713,39 +2721,39 @@ test('twin sync is idempotent across llm/adapters-updated events', async () => {
     },
   }
   ctx.llm.registerAdapter(['opencode-go'], thirdParty)
-  // every adapter change re-runs the sync; repeated runs must neither
-  // duplicate the route nor throw DUPLICATE_ADAPTER
+  // Repeated adapter changes re-run whatever listeners exist; the retired
+  // machine must never re-enter a DUPLICATE_ADAPTER throw or publish a route.
   fire()
   fire()
   fire()
-  assert.ok(adapters.has('opencode-go-vision'))
-  const listed = await adapters.get('opencode-go-vision').listModels('opencode-go-vision')
-  assert.deepEqual(listed.map((m) => m.id), ['deepseek-v4-flash', 'deepseek-v4-pro'])
+  assert.equal(adapters.has('opencode-go-vision'), false)
+  assert.equal(adapters.size, 0)
+  assert.deepEqual(directories, [])
 })
 
-test('apply falls back to the visible wrapper when the stock route is still active', async () => {
-  const { ctx, adapters } = mockHarnessCtx({ stockRoute: true })
+// ── retired wrapper route (plan §4.2): the whole-turn presentation shim ─────
+
+test('no wrapper route exists: the stock catalog and chain pairs are never mirrored', async () => {
+  const { ctx, adapters, directories } = mockHarnessCtx({ stockRoute: true })
   apply(ctx, Config({
     provider: 'openrouter',
     providers: [{ provider: 'openrouter', model: 'qwen/qwen3-vl-235b-a22b-instruct' }],
   }))
 
-  // the stock adapter still owns deepseek-official (stealth gave up cleanly)
+  // the stock adapter keeps owning deepseek-official (Host-owned, untouched)
   const listed = await adapters.get('deepseek-official').listModels('deepseek-official')
   assert.deepEqual(listed.map((m) => m.id), ['deepseek-v4-flash', 'deepseek-v4-pro'])
   assert.deepEqual(listed[0].inputModalities, ['text'])
-
-  // the wrapper route mirrors the stock models; in the default tools-first
-  // mode (routing off) the vision-chain pairs stay out of this group — they
-  // are legacy whole-turn routing markers, not DeepSeek entries
-  const wrapper = adapters.get('deepseek-vision')
-  const wrapped = await wrapper.listModels('deepseek-vision')
-  assert.deepEqual(wrapped.map((m) => m.id), ['deepseek-v4-flash', 'deepseek-v4-pro'])
-  assert.deepEqual(wrapped[0].inputModalities, ['text', 'image'])
+  await assert.throws(
+    () => ctx.llm.registration('deepseek-vision'),
+    /no adapter registered/,
+    'the retired wrapper route must not mirror the stock catalog',
+  )
+  assert.deepEqual(directories, [])
 })
 
-test('issue #479: main DeepSeek wrapper mirrors the live official catalog and ignores relay textProvider', async () => {
-  const { ctx, adapters, captured } = mockHarnessCtx({
+test('issue #479 retired: the main DeepSeek wrapper no longer mirrors any catalog', async () => {
+  const { ctx, adapters, directories, captured } = mockHarnessCtx({
     stockRoute: true,
     opencodeGo: true,
     config0: { textProvider: { provider: 'opencode-go', model: 'qwen3.6-plus' } },
@@ -2763,39 +2771,22 @@ test('issue #479: main DeepSeek wrapper mirrors the live official catalog and ig
   ]
 
   apply(ctx, Config({}))
-  const wrapper = adapters.get('deepseek-vision')
-  const listed = await wrapper.listModels('deepseek-vision')
+  await assert.throws(() => ctx.llm.registration('deepseek-vision'), /no adapter registered/)
+  // The live official catalog itself stays exactly as the Host published it.
+  const listed = await ctx.llm.listModels('deepseek-official')
   assert.deepEqual(listed.map((model) => model.id), [
     'deepseek-v4-flash',
     'deepseek-v4-pro',
     'deepseek-v4.1-flash-expires-on-0910',
   ])
-  assert.ok(listed.every((model) => model.provider === 'deepseek-vision'))
-  assert.ok(listed.every((model) => model.inputModalities.includes('image')))
-  assert.equal(wrapper.providerRetryPolicy('deepseek-vision'), 'retry')
-
-  const resolved = await wrapper.resolveModel(
-    'deepseek-vision',
-    'deepseek-v4.1-flash-expires-on-0910',
-  )
-  assert.equal(resolved.id, 'deepseek-v4.1-flash-expires-on-0910')
-  assert.equal(resolved.provider, 'deepseek-vision')
-  await assert.rejects(
-    wrapper.resolveModel('deepseek-vision', 'relay-only-model'),
-    /not in the live official catalog/,
-  )
-
-  for await (const _chunk of wrapper.stream({
-    model: 'deepseek-v4.1-flash-expires-on-0910',
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
-  })) {
-    // drain
-  }
-  assert.equal(captured.streamCalls.at(-1)?.provider, 'deepseek-official')
+  assert.equal(listed.every((model) => model.provider === 'deepseek-official'), true)
+  assert.deepEqual(directories, [])
+  // The catalog-legacy wrapper route must not hijack Host calls either.
+  assert.equal(captured.streamCalls.length, 0)
 })
 
-test('wrapper lists the vision-chain pairs only when whole-turn routing is on', async () => {
-  const { ctx, adapters } = mockHarnessCtx({ stockRoute: true, config0: { routing: true } })
+test('wrapper listing of vision-chain pairs is retired: routing rows stay Host rows', async () => {
+  const { ctx, adapters, directories } = mockHarnessCtx({ stockRoute: true, config0: { routing: true } })
   ctx.llm.registerAdapter(['openrouter'], {
     providerInfo: (p) => ({ id: p, name: 'OpenRouter' }),
     providerRetryPolicy: () => 'retry',
@@ -2811,21 +2802,14 @@ test('wrapper lists the vision-chain pairs only when whole-turn routing is on', 
     providers: [{ provider: 'openrouter', model: 'qwen/qwen3-vl-235b-a22b-instruct' }],
     routing: true,
   }))
-  const wrapper = adapters.get('deepseek-vision')
-  const wrapped = await wrapper.listModels('deepseek-vision')
-  assert.deepEqual(wrapped.map((m) => m.id), [
-    'deepseek-v4-flash',
-    'deepseek-v4-pro',
-    'openrouter/qwen/qwen3-vl-235b-a22b-instruct',
-  ])
-  const visionEntry = wrapped.find((m) => m.id === 'openrouter/qwen/qwen3-vl-235b-a22b-instruct')
-  assert.ok(visionEntry)
-  assert.deepEqual(visionEntry.inputModalities, ['text', 'image'])
-  assert.ok(String(visionEntry.name).includes('视觉'))
-  // resolving a vision-pair entry still returns image-capable metadata
-  const resolved = await wrapper.resolveModel('deepseek-vision', 'openrouter/qwen/qwen3-vl-235b-a22b-instruct')
+  await assert.throws(() => ctx.llm.registration('deepseek-vision'), /no adapter registered/)
+  assert.equal(adapters.size, 2, 'only the Host-owned routes exist (stock + openrouter)')
+  assert.deepEqual(directories, [])
+  // The real Host image route keeps its declared modalities — that is what
+  // whole-turn routing selects now.
+  const resolved = await ctx.llm.resolveModelInfo('openrouter', 'qwen/qwen3-vl-235b-a22b-instruct')
   assert.deepEqual(resolved.inputModalities, ['text', 'image'])
-  assert.equal(resolved.id, 'openrouter/qwen/qwen3-vl-235b-a22b-instruct')
+  assert.equal(resolved.id, 'qwen/qwen3-vl-235b-a22b-instruct')
 })
 test('floodFillBackground clears border-connected background pixels', () => {
   // 4x4: white background, black 2x2 square in the middle
@@ -3616,177 +3600,268 @@ test('channel bridge transport uses resolved pi-ai catalog model facts', () => {
   )
 })
 
-// ── strict-upstream audit (#103 follow-up) ─────────────────────────────────
-// The plugin fabricates capability hints (twin reasoning defaults, image
-// declarations on wrapper routes, extraVisionModels overrides). These tests
-// run a STRICT upstream that throws on anything it cannot actually handle,
-// proving nothing fabricated is ever forwarded unsafely.
+// ── strict-upstream audit, P5 execution chain ───────────────────────────────
+// The retired twin/wrapper fabricated capability hints (reasoning defaults,
+// image declarations on wrapper routes). The P5 execution chain must never
+// fabricate anything: the describe walk forwards no invented effort to the
+// Host adapter, and whole-turn image routing selects only REAL Host routes
+// attested as image-capable (fail-closed on unattested/text-only metadata).
 
-test('strict upstream: twin forwards only what the picker explicitly sent', async () => {
-  const supported = new Set(['off', 'high', 'max'])
-  const { ctx, adapters } = mockHarnessCtx({
-    config0: { wrappedProviders: [{ provider: 'opencode-go', models: [] }] },
-  })
-  const strict = {
-    providerInfo: (p) => ({ id: p, name: 'Opencode' }),
-    providerRetryPolicy: () => 'retry',
-    listModels: async (p) => [
-      { provider: p, id: 'm', name: 'M', inputModalities: ['text'], reasoning: { efforts: [...supported] } },
-    ],
-    resolveModel: async (p, m) => ({
-      provider: p, id: m, name: m, inputModalities: ['text'], context: { contextWindow: 100000 },
-      reasoning: { efforts: [...supported] },
-    }),
-  }
-  ctx.llm.registerAdapter(['opencode-go'], strict)
-  apply(ctx, Config({}))
-  const twin = adapters.get('opencode-go-vision')
+test('strict upstream: the describe walk never forwards a fabricated reasoning effort', async () => {
+  const driver = await driveDescribe({ opencodeGoMode: 'fixed' })
   const seen = []
-  ctx.llm.stream = async function* (options) {
-    if (options.reasoningEffort !== undefined && !supported.has(options.reasoningEffort)) {
-      throw new Error(`strict upstream rejects reasoningEffort "${options.reasoningEffort}"`)
+  driver.ctx.llm.stream = async function* (options) {
+    // A strict upstream rejects anything it did not declare — including an
+    // invented reasoning effort the plugin has no authority to add. The walk
+    // must pass only provider/model/messages/maxTokens/signal/sessionId.
+    if (options.reasoningEffort !== undefined) {
+      throw new Error(`strict upstream rejects fabricated reasoningEffort "${options.reasoningEffort}"`)
     }
-    seen.push(options.reasoningEffort)
+    if (options.provider !== 'opencode-go' || options.model !== 'qwen3.6-plus') {
+      throw new Error(`unexpected Host route ${options.provider}/${options.model}`)
+    }
+    seen.push({ ...options })
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text: 'ok' }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: 'ok' } }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
-  const drain = async (options) => {
-    for await (const _c of twin.stream(options)) {
-      /* drain */
-    }
-  }
-  // the user picked 'max' in the bottom-right selector: the first step
-  // carries it, and the wrapper remembers it for the steps that follow
-  await drain({ provider: 'opencode-go-vision', model: 'm', messages: [], reasoningEffort: 'max' })
-  await drain({ provider: 'opencode-go-vision', model: 'm', messages: [] })
-  assert.deepEqual(seen, ['max', 'max'])
-})
-
-test('strict upstream: twin never leaks image blocks to a text-only source', async () => {
-  const { ctx, adapters } = mockHarnessCtx({
-    config0: { wrappedProviders: [{ provider: 'opencode-go', models: [] }] },
-  })
-  const strict = {
-    providerInfo: (p) => ({ id: p, name: 'Opencode' }),
-    providerRetryPolicy: () => 'retry',
-    listModels: async (p) => [
-      { provider: p, id: 'm', name: 'M', inputModalities: ['text'] },
-    ],
-    resolveModel: async (p, m) => ({
-      provider: p, id: m, name: m, inputModalities: ['text'], context: { contextWindow: 100000 },
-    }),
-  }
-  ctx.llm.registerAdapter(['opencode-go'], strict)
-  apply(ctx, Config({}))
-  const twin = adapters.get('opencode-go-vision')
-  const seen = []
-  ctx.llm.stream = async function* (options) {
-    const flattened = JSON.stringify(options.messages)
-    if (flattened.includes('"type":"image"')) {
-      throw new Error('strict upstream rejects image blocks')
-    }
-    seen.push(options)
-    yield { type: 'finish', reason: { kind: 'stop' } }
-  }
-  const messages = [
-    { role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'img-1', name: 'a.png' } }, { type: 'text', text: '看这张图' }] },
-  ]
-  for await (const _c of twin.stream({ provider: 'opencode-go-vision', model: 'm', messages })) {
-    /* drain */
-  }
+  const answer = await driver.run()
+  assert.equal(answer, 'ok')
   assert.equal(seen.length, 1)
-  assert.equal(seen[0].messages[0].content.filter((b) => b.type === 'image').length, 0)
+  assert.equal(seen[0].sessionId, 'session-410-corrected')
 })
 
-test('strict upstream: vision chain fails over when a forced extraVisionModels backend rejects the image', async () => {
-  // The chain route is an eager composition-level opt-in (registered while
-  // apply() still reads the composition config), while its pair list is read
-  // lazily from the settings scope — supply both layers.
-  const chainConfig = {
+test('strict upstream: an unattested text-only route never receives an image turn', async () => {
+  const config = {
+    providers: [{ provider: 'openrouter', model: 'qwen/qwen3-vl-235b-a22b-instruct' }],
     routing: true,
-    chainRoute: 'vision-chain',
-    providers: [
-      { provider: 'forced', model: 'fake-vl' },
-      { provider: 'good', model: 'qwen-vl' },
-    ],
-    // The expert escape hatch forces a text-only model into the chain —
-    // the strict upstream rejects it, and the chain must fall through to
-    // the genuinely image-capable backend.
-    extraVisionModels: ['forced/fake-vl'],
+    downscale: false,
   }
-  const { ctx, adapters } = mockHarnessCtx({ config0: chainConfig })
-  const forced = {
-    providerInfo: (p) => ({ id: p, name: 'Forced' }),
+  const { ctx, captured } = mockHarnessCtx({ config0: config, attachments: true })
+  // The Host's openrouter adapter declares TEXT only.
+  ctx.llm.registerAdapter(['openrouter'], {
+    providerInfo: (p) => ({ id: p, name: 'OpenRouter' }),
     providerRetryPolicy: () => 'retry',
-    listModels: async (p) => [{ provider: p, id: 'fake-vl', name: 'Fake-VL', inputModalities: ['text'] }],
+    listModels: async (p) => [
+      { provider: p, id: 'qwen/qwen3-vl-235b-a22b-instruct', name: 'Qwen3-VL', inputModalities: ['text'] },
+    ],
     resolveModel: async (p, m) => ({
       provider: p, id: m, name: m, inputModalities: ['text'], context: { contextWindow: 100000 },
     }),
+  })
+  // The Agent inbox projection seam (the last synchronously observable input
+  // before the modern Host freezes the step model).
+  const inboxBySession = new Map()
+  const originalGet = ctx.get.bind(ctx)
+  ctx.get = (name) => {
+    if (name === 'sessionProjections') {
+      return { stateOf: (session, kind) => (kind === 'inbox' ? inboxBySession.get(session) : undefined) }
+    }
+    return originalGet(name)
   }
-  const good = {
-    providerInfo: (p) => ({ id: p, name: 'Good' }),
+  apply(ctx, Config(config))
+  const onStatus = captured.on.get('agent/status')
+  assert.equal(typeof onStatus, 'function')
+  const agent = {
+    status: 'running',
+    session: { id: 'strict-unattested-session' },
+    model: {
+      current: () => ({ provider: 'openrouter', model: 'qwen/qwen3-vl-235b-a22b-instruct' }),
+      select: () => { throw new Error('strict upstream: no image route may ever be selected') },
+    },
+  }
+  inboxBySession.set(agent.session, {
+    'next-turn': [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'img-1', name: 'a.png' } }] }],
+    'next-step': [],
+  })
+  // Let the declared-modality attestation pass (apply() kicks it off async).
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  onStatus({ agent, status: 'running' })
+  // The whole-turn router failed closed: the text-only-declared route stays
+  // selected and the image turn is served by the vision tools instead.
+  assert.equal(captured.streamCalls.length, 0, 'no Host stream may be issued from a routing probe')
+})
+
+test('strict upstream: an attested image-capable route receives the temporary selection', async () => {
+  const config = {
+    // The chat model stays on the text-only Host row; the image-capable row
+    // joins the routing pairs.
+    provider: 'deepseek-official',
+    model: 'deepseek-v4-pro',
+    providers: [
+      { provider: 'deepseek-official', model: 'deepseek-v4-pro' },
+      { provider: 'openrouter', model: 'qwen/qwen3-vl-235b-a22b-instruct' },
+    ],
+    routing: true,
+    downscale: false,
+  }
+  const { ctx, captured } = mockHarnessCtx({ config0: config, attachments: true })
+  ctx.llm.registerAdapter(['openrouter'], {
+    providerInfo: (p) => ({ id: p, name: 'OpenRouter' }),
     providerRetryPolicy: () => 'retry',
-    listModels: async (p) => [{ provider: p, id: 'qwen-vl', name: 'Qwen-VL', inputModalities: ['text', 'image'] }],
+    listModels: async (p) => [
+      { provider: p, id: 'qwen/qwen3-vl-235b-a22b-instruct', name: 'Qwen3-VL', inputModalities: ['text', 'image'] },
+    ],
     resolveModel: async (p, m) => ({
       provider: p, id: m, name: m, inputModalities: ['text', 'image'], context: { contextWindow: 100000 },
     }),
+    stream: async function* () { yield { type: 'finish', reason: { kind: 'stop' } } },
+  })
+  ctx.llm.registerAdapter(['deepseek-official'], {
+    providerInfo: (p) => ({ id: p, name: 'DeepSeek' }),
+    providerRetryPolicy: () => 'retry',
+    listModels: async (p) => [{ provider: p, id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', inputModalities: ['text'] }],
+    resolveModel: async (p, m) => ({
+      provider: p, id: m, name: m, inputModalities: ['text'], context: { contextWindow: 100000 },
+    }),
+    stream: async function* () { yield { type: 'finish', reason: { kind: 'stop' } } },
+  })
+  const inboxBySession = new Map()
+  const originalGet = ctx.get.bind(ctx)
+  ctx.get = (name) => {
+    if (name === 'sessionProjections') {
+      return { stateOf: (session, kind) => (kind === 'inbox' ? inboxBySession.get(session) : undefined) }
+    }
+    return originalGet(name)
   }
-  ctx.llm.registerAdapter(['forced'], forced)
-  ctx.llm.registerAdapter(['good'], good)
-  apply(ctx, Config(chainConfig))
-  const chain = adapters.get('vision-chain')
-  assert.ok(chain, 'expected the vision chain route')
-  const calls = []
-  ctx.llm.stream = async function* (options) {
-    calls.push(options.provider)
-    if (options.provider === 'forced') throw new Error('forced backend rejects images')
-    yield { type: 'text', text: 'ok' }
-    yield { type: 'finish', reason: { kind: 'stop' } }
+  apply(ctx, Config(config))
+  const onStatus = captured.on.get('agent/status')
+  const selections = []
+  const agent = {
+    status: 'running',
+    session: { id: 'strict-attested-session' },
+    model: {
+      current: () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }),
+      select: (selection) => selections.push({ ...selection }),
+    },
   }
-  const messages = [
-    { role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'img-1', name: 'a.png' } }, { type: 'text', text: '看' }] },
-  ]
-  const chunks = []
-  for await (const chunk of chain.stream({ provider: 'vision-chain', model: 'forced/fake-vl', messages })) {
-    chunks.push(chunk)
-  }
-  assert.deepEqual(calls, ['forced', 'good'])
-  assert.equal(chunks[chunks.length - 1].type, 'finish')
-  assert.equal(chunks[chunks.length - 1].reason.kind, 'stop')
+  inboxBySession.set(agent.session, {
+    'next-turn': [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'img-1', name: 'a.png' } }] }],
+    'next-step': [],
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  onStatus({ agent, status: 'running' })
+  // The REAL Host image route was selected — a registered provider/model with
+  // declared image input, never a composed route id.
+  assert.deepEqual(selections, [
+    { provider: 'openrouter', model: 'qwen/qwen3-vl-235b-a22b-instruct' },
+  ])
 })
 
-test('legacy routing mounts follow the settings document without a restart', async () => {
-  const { ctx, adapters, captured, userDoc, settingsWatchers } = mockHarnessCtx({
-    config0: { routing: false },
+test('strict upstream: the tool walk fails over when a forced extraVisionModels backend rejects the image', async () => {
+  // The expert escape hatch forces a text-only-declared model into the vision
+  // walk — the strict upstream rejects it, and the walk must fall through to
+  // the genuinely image-capable backend, then stop (never reaching the free
+  // OVH fallback behind healthy configured rows).
+  const config = {
+    routing: true,
+    downscale: false,
+    providers: [
+      { provider: 'forced', model: 'qwen-vl-forced' },
+      { provider: 'good', model: 'qwen-vl' },
+    ],
+    extraVisionModels: ['forced/qwen-vl-forced'],
+  }
+  const driver = await driveDescribe({ opencodeGoMode: false, config0: config })
+  const hostAttempts = []
+  driver.ctx.llm.stream = async function* (options) {
+    hostAttempts.push(options.provider)
+    if (options.provider === 'forced') throw new Error('forced backend rejects images')
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text: 'ok' }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: 'ok' } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  const original = globalThis.fetch
+  let fetchCalls = 0
+  globalThis.fetch = async () => {
+    fetchCalls += 1
+    throw new Error('the free fallback must not run behind healthy configured rows')
+  }
+  let answer
+  try {
+    answer = await driver.run()
+  } finally {
+    globalThis.fetch = original
+  }
+  assert.equal(answer, 'ok')
+  assert.deepEqual(hostAttempts, ['forced', 'good'])
+  assert.equal(fetchCalls, 0)
+  // Both rows are Host-owned adapters; the plugin mounted nothing itself.
+  assert.equal(driver.adapters.size, 2)
+})
+
+test('whole-turn routing selection follows the settings document without a restart', async () => {
+  const config = {
+    provider: 'openrouter',
+    providers: [{ provider: 'openrouter', model: 'qwen/qwen3-vl-235b-a22b-instruct' }],
+    routing: false,
+    chainRoute: '',
+    autoActivateOnImage: false,
+  }
+  const { ctx, captured, userDoc, settingsWatchers } = mockHarnessCtx({ config0: config, attachments: true })
+  ctx.llm.registerAdapter(['openrouter'], {
+    providerInfo: (p) => ({ id: p, name: 'OpenRouter' }),
+    providerRetryPolicy: () => 'retry',
+    listModels: async (p) => [
+      { provider: p, id: 'qwen/qwen3-vl-235b-a22b-instruct', name: 'Qwen3-VL', inputModalities: ['text', 'image'] },
+    ],
+    resolveModel: async (p, m) => ({
+      provider: p, id: m, name: m, inputModalities: ['text', 'image'], context: { contextWindow: 100000 },
+    }),
+    stream: async function* () { yield { type: 'finish', reason: { kind: 'stop' } } },
   })
-  apply(ctx, Config({}))
+  apply(ctx, Config(config))
   // The agent/request hook is registered unconditionally and gates at
   // runtime, so the settings switch reaches it immediately.
-  assert.equal(typeof captured.on.get('agent/request'), 'function')
-  assert.equal(adapters.has('vision-chain'), false, 'chain route off while routing is disabled')
+  const request = captured.on.get('agent/request')
+  const preStep = captured.on.get('agent/pre-step')
+  assert.equal(typeof request, 'function')
+  assert.equal(typeof preStep, 'function')
+  const payload = {
+    agent: { session: { id: 'settings-live-session', events: [] } },
+    turn: 7,
+    messages: [
+      { role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'img-1', name: 'a.png' } }] },
+    ],
+  }
+  const next = async () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro' })
+  // routing off: the image turn keeps the chat model
+  await preStep(payload, async () => ({ messages: payload.messages }))
+  assert.deepEqual(await request(payload, next), { provider: 'deepseek-official', model: 'deepseek-v4-pro' })
   // the user flips the routing switch in the settings card
   userDoc.routing = true
   for (const watch of settingsWatchers) watch()
-  assert.ok(adapters.has('vision-chain'), 'chain route mounts when routing turns on')
+  await preStep(payload, async () => ({ messages: payload.messages }))
+  const routed = await request(payload, next)
+  assert.equal(routed.provider, 'openrouter', 'image turns route to the first real Host vision row')
+  assert.equal(routed.model, 'qwen/qwen3-vl-235b-a22b-instruct')
+  assert.equal(routed.reasoningEffort, undefined, 'the previous provider effort must be dropped on switch')
   // and off again
   userDoc.routing = false
   for (const watch of settingsWatchers) watch()
-  assert.equal(adapters.has('vision-chain'), false, 'chain route unmounts when routing turns off')
+  await preStep(payload, async () => ({ messages: payload.messages }))
+  assert.deepEqual(await request(payload, next), { provider: 'deepseek-official', model: 'deepseek-v4-pro' })
 })
 
-test('wrapper route mount follows the settings wrapperRoute name', async () => {
-  const { ctx, adapters, userDoc, settingsWatchers } = mockHarnessCtx({
+test('retired wrapperRoute stays read-only compat data under settings edits', async () => {
+  const { ctx, adapters, directories, userDoc, settingsWatchers } = mockHarnessCtx({
     stockRoute: true,
     config0: { wrapperRoute: '' },
   })
   apply(ctx, Config({}))
-  assert.equal(adapters.has('deepseek-vision'), false, 'no wrapper while the name is empty')
+  assert.equal(adapters.size, 1, 'only the Host stock route exists')
   userDoc.wrapperRoute = 'deepseek-vision'
   for (const watch of settingsWatchers) watch()
-  assert.ok(adapters.has('deepseek-vision'), 'wrapper mounts under the configured name')
+  await assert.throws(() => ctx.llm.registration('deepseek-vision'), /no adapter registered/)
   userDoc.wrapperRoute = 'my-wrapper'
   for (const watch of settingsWatchers) watch()
-  assert.equal(adapters.has('deepseek-vision'), false, 'old name is disposed')
-  assert.ok(adapters.has('my-wrapper'), 'wrapper re-mounts under the new name')
+  await assert.throws(() => ctx.llm.registration('my-wrapper'), /no adapter registered/)
+  assert.equal(adapters.size, 1)
+  assert.deepEqual(directories, [])
 })
 
 test('httpProviderFallbackWeight charges one slice for built-in OVH, a full tier for locals', () => {
@@ -3831,68 +3906,50 @@ test('weightedFallbackBudget allocates fair shares and clamps to the limits', ()
   assert.equal(weightedFallbackBudget(-5, NaN, 0, 0), 1)
 })
 
-test('chain injects the configured local backend ahead of the http rows', async () => {
+// ── direct-backend local rows: wire conversion through the provider transport
+//
+// P5: a configured local backend executes through the direct-backend walk
+// (vision_describe tool) over the Router-owned provider transport. The walk's
+// ordering still puts the configured local backend ahead of the built-in free
+// rows, and each wire format keeps its system text and image blocks.
+
+test('the describe walk serves the configured local backend ahead of the free rows', async () => {
   const config = {
-    routing: true,
-    freeFallback: false,
+    downscale: false,
     localOllama: { enabled: true, baseURL: 'http://127.0.0.1:11434/v1', model: 'qwen2.5vl' },
   }
-  const { ctx, adapters } = mockHarnessCtx({ attachments: true, config0: config })
-  apply(ctx, Config(config))
-  const chain = adapters.get('vision-chain')
-  assert.ok(chain)
-  // The stock mock llm.stream is a no-op stub; dispatch to the registered
-  // adapter so the chain reaches the vision-http route and its HTTP call.
-  ctx.llm.stream = async function* (options) {
-    const adapter = adapters.get(options.provider)
-    if (adapter === undefined || typeof adapter.stream !== 'function') {
-      yield {
-        type: 'finish',
-        reason: {
-          kind: 'error',
-          failure: { message: `no adapter registered for provider "${options.provider}"` },
-        },
-      }
-      return
-    }
-    yield* adapter.stream(options)
+  const { ctx, captured, adapters } = mockHarnessCtx({ attachments: true, config0: config })
+  const transportCalls = []
+  const providerTransport = {
+    async fetch(input, init) {
+      transportCalls.push({ url: String(input), body: JSON.parse(init.body) })
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'LOCAL OK' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
   }
-
-  const original = globalThis.fetch
-  let captured
-  globalThis.fetch = async (url, init) => {
-    captured = { url: String(url), body: JSON.parse(init.body) }
-    return new Response(JSON.stringify({ choices: [{ message: { content: 'LOCAL OK' } }] }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    })
-  }
-  try {
-    const chunks = []
-    for await (const chunk of chain.stream({
-      provider: 'vision-chain',
-      model: 'local-ollama/qwen2.5vl',
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'What is this?' }] }],
-    })) {
-      chunks.push(chunk)
-    }
-    assert.equal(captured.url, 'http://127.0.0.1:11434/v1/chat/completions')
-    assert.equal(captured.body.model, 'qwen2.5vl')
-    const text = chunks
-      .filter((chunk) => chunk.type === 'text-delta')
-      .map((chunk) => chunk.text)
-      .join('')
-    assert.equal(text, 'LOCAL OK')
-    assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
-  } finally {
-    globalThis.fetch = original
-  }
+  apply(ctx, Config(config), { providerTransport })
+  const activate = captured.tools.find((entry) => entry?.name === 'vision_activate')
+  assert.ok(activate)
+  await activate.execute({}, {})
+  const describe = captured.tools.find((entry) => entry?.name === 'vision_describe')
+  assert.ok(describe)
+  const result = await describe.execute(
+    { paths: ['/tmp/fake.png'], question: 'What is this?' },
+    { agent: { session: { id: 'local-first-session', events: [] } } },
+  )
+  // The configured local backend answered FIRST — before any built-in free
+  // endpoint could burn the anonymous quota behind a healthy local row.
+  assert.equal(result, 'LOCAL OK')
+  assert.equal(transportCalls.length, 1)
+  assert.equal(transportCalls[0].url, 'http://127.0.0.1:11434/v1/chat/completions')
+  assert.equal(transportCalls[0].body.model, 'qwen2.5vl')
+  assert.equal(adapters.size, 0, 'no Host route may back the local backend')
 })
 
-test('anthropic-format local backend keeps system text and image blocks', async () => {
+test('anthropic-format local backend keeps system text and image blocks on the provider transport', async () => {
   const config = {
-    routing: true,
-    freeFallback: false,
     downscale: false,
     localOllama: {
       enabled: true,
@@ -3901,69 +3958,65 @@ test('anthropic-format local backend keeps system text and image blocks', async 
       format: 'anthropic',
     },
   }
-  const { ctx, adapters } = mockHarnessCtx({ attachments: true, config0: config })
-  apply(ctx, Config(config))
-  const chain = adapters.get('vision-chain')
-  assert.ok(chain)
-  ctx.llm.stream = async function* (options) {
-    const adapter = adapters.get(options.provider)
-    if (adapter === undefined || typeof adapter.stream !== 'function') {
-      yield {
-        type: 'finish',
-        reason: {
-          kind: 'error',
-          failure: { message: `no adapter registered for provider "${options.provider}"` },
-        },
-      }
-      return
-    }
-    yield* adapter.stream(options)
+  const { ctx, captured, adapters } = mockHarnessCtx({ attachments: true, config0: config })
+  const transportCalls = []
+  const providerTransport = {
+    async fetch(input, init) {
+      transportCalls.push({ url: String(input), headers: init.headers, body: JSON.parse(init.body) })
+      return new Response(JSON.stringify({ content: [{ type: 'text', text: 'ANTH OK' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
   }
-
-  const original = globalThis.fetch
-  let captured
-  globalThis.fetch = async (url, init) => {
-    captured = { url: String(url), headers: init.headers, body: JSON.parse(init.body) }
-    return new Response(JSON.stringify({ content: [{ type: 'text', text: 'ANTH OK' }] }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    })
-  }
-  try {
-    const chunks = []
-    for await (const chunk of chain.stream({
-      provider: 'vision-chain',
-      model: 'local-ollama/qwen2.5vl',
-      messages: [
-        { role: 'system', content: [{ type: 'text', text: 'Be terse.' }] },
-        {
-          role: 'user',
-          content: [
-            { type: 'image', attachment: { attachmentId: 'img-1', mediaType: 'image/png' } },
-            { type: 'text', text: 'What is this?' },
-          ],
-        },
-      ],
-    })) {
-      chunks.push(chunk)
-    }
-    assert.equal(captured.url, 'http://127.0.0.1:11434/v1/messages')
-    assert.equal(captured.body.model, 'qwen2.5vl')
-    assert.equal(captured.body.system, 'Be terse.')
-    const imageBlocks = captured.body.messages[0].content.filter((block) => block.type === 'image')
-    assert.equal(imageBlocks.length, 1)
-    assert.equal(imageBlocks[0].source.type, 'base64')
-    assert.equal(imageBlocks[0].source.media_type, 'image/png')
-    assert.ok(imageBlocks[0].source.data.length > 0)
-    assert.equal(captured.headers['x-api-key'], undefined, 'keyless local backend omits the header')
-    const text = chunks
-      .filter((chunk) => chunk.type === 'text-delta')
-      .map((chunk) => chunk.text)
-      .join('')
-    assert.equal(text, 'ANTH OK')
-  } finally {
-    globalThis.fetch = original
-  }
+  apply(ctx, Config(config), { providerTransport })
+  const activate = captured.tools.find((entry) => entry?.name === 'vision_activate')
+  assert.ok(activate)
+  await activate.execute({}, {})
+  const describe = captured.tools.find((entry) => entry?.name === 'vision_describe')
+  assert.ok(describe)
+  const result = await describe.execute(
+    { paths: ['/tmp/fake.png'], question: 'What is this?' },
+    { agent: { session: { id: 'local-anthropic-session', events: [] } } },
+  )
+  assert.equal(result, 'ANTH OK')
+  assert.equal(transportCalls.length, 1)
+  assert.equal(transportCalls[0].url, 'http://127.0.0.1:11434/v1/messages')
+  assert.equal(transportCalls[0].body.model, 'qwen2.5vl')
+  // The walk's image block survives the Anthropic conversion as base64.
+  const imageBlocks = transportCalls[0].body.messages[0].content.filter((block) => block.type === 'image')
+  assert.equal(imageBlocks.length, 1)
+  assert.equal(imageBlocks[0].source.type, 'base64')
+  assert.equal(imageBlocks[0].source.media_type, 'image/png')
+  assert.ok(imageBlocks[0].source.data.length > 0)
+  // The focused question rides the user content (the walk has no system
+  // frame; the vision instruction must not be lost in conversion either).
+  const textBlocks = transportCalls[0].body.messages[0].content.filter((block) => block.type === 'text')
+  assert.ok(textBlocks.some((block) => block.text.includes('What is this?')))
+  assert.equal(transportCalls[0].headers['x-api-key'], undefined, 'keyless local backend omits the header')
+  assert.equal(adapters.size, 0)
+  // The Anthropic conversion primitive the walk delegates to keeps SYSTEM
+  // text on the dedicated wire field (regression guard for local callers
+  // that do send a system frame, e.g. vision_screenshot identify).
+  const converted = await callLocalBackend(
+    { name: 'local-ollama', baseURL: 'http://127.0.0.1:11434/v1', model: 'qwen2.5vl', format: 'anthropic', apiKeyEnv: '' },
+    [
+      { role: 'system', content: [{ type: 'text', text: 'Be terse.' }] },
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+          { type: 'text', text: 'What is this?' },
+        ],
+      },
+    ],
+    { providerTransport },
+  )
+  assert.equal(converted, 'ANTH OK')
+  const wire = transportCalls[1]
+  assert.equal(wire.body.system, 'Be terse.')
+  assert.equal(wire.body.messages[0].role, 'user')
+  assert.equal(wire.body.messages[0].content.filter((block) => block.type === 'image').length, 1)
 })
 
 
@@ -4069,85 +4122,98 @@ test('batch3: direct OpenAI success bodies are rejected before oversized JSON al
   }
 })
 
-// ── vision-http chain dispatch: format=lmstudio rides callLocalBackend ──────
+// ── direct-backend local rows: format dispatch over the provider transport ─
 //
-// Regression for the #550 follow-up: the settings surfaces expose the LM
-// Studio native transport (`format: 'lmstudio'`), and callLocalBackend maps
-// it to POST {apiRoot}/api/v1/chat — but the vision-http chain's dispatch
-// only special-cased format='anthropic', so the main vision chain silently
-// hit the OpenAI-compatible /chat/completions endpoint instead (no
-// `reasoning: off`, different wire) while every other path (instant local
-// describe, vision_screenshot identify) used the native transport.
+// Regression for the #550 follow-up, P5 edition: the settings surfaces expose
+// the LM Studio native transport (`format: 'lmstudio'`), and callLocalBackend
+// maps it to POST {apiRoot}/api/v1/chat, while format='anthropic' keeps the
+// Anthropic wire and the default rides the OpenAI-compatible /chat/completions.
+// P5: the walk is driven through the vision_describe tool (no Host route),
+// local rows execute through the Router-owned provider transport, and the
+// tool-side ordering still puts the configured local backend ahead of the
+// built-in free rows.
 
-test('vision-http chain routes format=lmstudio through the native local backend', async () => {
-  const { ctx } = mockHarnessCtx()
+test('the describe walk routes format=lmstudio through the native local transport', async () => {
+  const { ctx, captured } = mockHarnessCtx()
+  const transportCalls = []
+  const providerTransport = {
+    async fetch(input, init) {
+      transportCalls.push({ url: String(input), body: JSON.parse(init.body) })
+      return new Response(JSON.stringify({
+        output: [{ type: 'message', content: 'native-ok' }],
+        stats: { total_output_tokens: 2 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    },
+  }
   apply(ctx, Config({
     localLmStudio: { enabled: true, model: 'qwen2.5-vl', format: 'lmstudio' },
-  }))
-  const adapter = ctx.llm.registration('vision-http').adapter
+  }), { providerTransport })
   const original = globalThis.fetch
-  const calls = []
-  globalThis.fetch = async (url, init) => {
-    calls.push({ url: String(url), body: JSON.parse(init.body) })
-    return new Response(JSON.stringify({
-      output: [{ type: 'message', content: 'native-ok' }],
-      stats: { total_output_tokens: 2 },
-    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  let bareFetchCalls = 0
+  globalThis.fetch = async () => {
+    bareFetchCalls += 1
+    throw new Error('bare fetch must not own provider egress')
   }
+  let result
   try {
-    const chunks = []
-    for await (const chunk of adapter.stream({
-      model: 'local-lmstudio/qwen2.5-vl',
-      messages: [{ role: 'user', content: [{ type: 'text', text: '看这张图' }] }],
-    })) {
-      chunks.push(chunk)
-    }
-    assert.equal(calls.length, 1)
-    assert.ok(calls[0].url.endsWith('/api/v1/chat'), `native endpoint expected, got ${calls[0].url}`)
-    assert.equal(calls[0].body.reasoning, 'off')
-    assert.equal(calls[0].body.max_output_tokens, 4096)
-    const text = chunks
-      .filter((chunk) => chunk.type === 'text-delta')
-      .map((chunk) => chunk.text)
-      .join('')
-    assert.equal(text, 'native-ok')
+    const activate = captured.tools.find((entry) => entry?.name === 'vision_activate')
+    assert.ok(activate)
+    await activate.execute({}, {})
+    const describe = captured.tools.find((entry) => entry?.name === 'vision_describe')
+    assert.ok(describe)
+    result = await describe.execute(
+      { paths: ['/tmp/fake.png'], question: 'What is this?' },
+      { agent: { session: { id: 'lmstudio-native-session', events: [] } } },
+    )
   } finally {
     globalThis.fetch = original
   }
+  assert.equal(bareFetchCalls, 0)
+  assert.equal(transportCalls.length, 1)
+  assert.ok(transportCalls[0].url.endsWith('/api/v1/chat'), `native endpoint expected, got ${transportCalls[0].url}`)
+  assert.equal(transportCalls[0].body.reasoning, 'off')
+  assert.equal(transportCalls[0].body.max_output_tokens, 4096)
+  assert.equal(result, 'native-ok')
 })
 
-test('vision-http chain keeps format=openai local backends on the compatible endpoint', async () => {
-  const { ctx } = mockHarnessCtx()
+test('the describe walk keeps format=openai local backends on the compatible endpoint', async () => {
+  const { ctx, captured } = mockHarnessCtx()
+  const transportCalls = []
+  const providerTransport = {
+    async fetch(input, init) {
+      transportCalls.push({ url: String(input) })
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'compat-ok' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    },
+  }
   apply(ctx, Config({
     localLmStudio: { enabled: true, model: 'qwen2.5-vl' },
-  }))
-  const adapter = ctx.llm.registration('vision-http').adapter
+  }), { providerTransport })
   const original = globalThis.fetch
-  const calls = []
-  globalThis.fetch = async (url, init) => {
-    calls.push({ url: String(url) })
-    return new Response(JSON.stringify({
-      choices: [{ message: { content: 'compat-ok' } }],
-    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  let bareFetchCalls = 0
+  globalThis.fetch = async () => {
+    bareFetchCalls += 1
+    throw new Error('bare fetch must not own provider egress')
   }
+  let result
   try {
-    const chunks = []
-    for await (const chunk of adapter.stream({
-      model: 'local-lmstudio/qwen2.5-vl',
-      messages: [{ role: 'user', content: [{ type: 'text', text: '看这张图' }] }],
-    })) {
-      chunks.push(chunk)
-    }
-    assert.equal(calls.length, 1)
-    assert.ok(calls[0].url.endsWith('/chat/completions'), `compatible endpoint expected, got ${calls[0].url}`)
-    const text = chunks
-      .filter((chunk) => chunk.type === 'text-delta')
-      .map((chunk) => chunk.text)
-      .join('')
-    assert.equal(text, 'compat-ok')
+    const activate = captured.tools.find((entry) => entry?.name === 'vision_activate')
+    assert.ok(activate)
+    await activate.execute({}, {})
+    const describe = captured.tools.find((entry) => entry?.name === 'vision_describe')
+    assert.ok(describe)
+    result = await describe.execute(
+      { paths: ['/tmp/fake.png'], question: 'What is this?' },
+      { agent: { session: { id: 'lmstudio-compat-session', events: [] } } },
+    )
   } finally {
     globalThis.fetch = original
   }
+  assert.equal(bareFetchCalls, 0)
+  assert.equal(transportCalls.length, 1)
+  assert.ok(transportCalls[0].url.endsWith('/chat/completions'), `compatible endpoint expected, got ${transportCalls[0].url}`)
+  assert.equal(result, 'compat-ok')
 })
 
 test('issue #646 pre-step instant describe uses the Router-owned provider transport', async () => {
