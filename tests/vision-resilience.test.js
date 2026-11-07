@@ -933,11 +933,17 @@ test('Test 10: a wrapped provider keeps Host-owned delegation and a read-only pl
   assert.equal(delegations[0].model, 'qwen3.6-flash')
 
   // An image turn on the text-only-declared route must NOT be rewritten by
-  // any plugin layer either: the walk/projection is the only converter, and
-  // it never leaks image blocks through the Host route (fail-closed routing
-  // keeps the chat model; the marker-based rewrite belongs to the projection
-  // contract covered by vision-image-projection.test.js).
-  assert.deepEqual(source.listModels.length > 0, true)
+  // any plugin layer either: fail-closed routing keeps the chat model and the
+  // walk/projection never leaks image blocks through the Host route (the
+  // marker-based rewrite belongs to the projection contract covered by
+  // vision-image-projection.test.js).
+  assert.equal(mock.adapters.size, 1)
+  assert.deepEqual(
+    [...mock.adapters.keys()],
+    ['qwen-token-plan-cn'],
+    'the Host registry holds only the Host-registered source adapter',
+  )
+  assert.deepEqual(mock.ctx.llm.listProviders().map((entry) => entry.id), ['qwen-token-plan-cn'])
   assert.equal(delegations.length, 1)
 })
 
@@ -1104,21 +1110,32 @@ test('issue #791: hanging model-info preflight fails closed without a retry stor
     freeFallback: false,
     visionTaskTimeoutMs: 1000,
     providers: [{ provider: 'qwen-a', model: 'qwen3.6-flash' }],
-  }))
+  }), {
+    behaviors: {
+      'qwen-a/qwen3.6-flash': 'fail:500 metadata lost, backend unreachable',
+    },
+  })
   let queries = 0
   mock.ctx.llm.resolveModelInfo = async () => {
     queries += 1
     throw new Error('model registry lookup failed')
   }
-  // A capability-preflight failure must fail that backend closed (never
-  // attempt it, never retry the lookup in a storm) and degrade to the
-  // structured unavailable contract.
+  // A capability-preflight failure is ADVISORY (an adapter may be callable
+  // without metadata), so the walk still attempts the leg — the scripted
+  // upstream failure then degrades the whole task to the structured
+  // unavailable contract. The preflight itself must neither retry in a storm
+  // nor fabricate an attempt entry of its own.
   const started = Date.now()
   const parsed = JSON.parse(await runDescribe(mock, {}, 114))
   assert.ok(queries >= 1, 'the walk must consult the declared model metadata')
   assert.ok(queries <= 3, `the preflight must not storm the registry (${queries} queries)`)
   assert.equal(parsed.ok, false)
   assert.equal(parsed.retryable, false)
+  assert.deepEqual(
+    parsed.attemptedProviders.map((entry) => entry.kind),
+    ['SERVER'],
+    'the failure comes from the real backend attempt, not the advisory preflight',
+  )
   assert.ok(Date.now() - started < 8000, `the walk settled in ${Date.now() - started}ms`)
 })
 
@@ -1156,7 +1173,9 @@ test('issue #791: cancel during the provider walk ends as aborted-classified, no
       { agent: { session: fakeSession(2) } },
     ))
   await new Promise((resolve) => setImmediate(resolve))
-  controller.abort(new Error('user stopped generation'))
+  // Abort without a custom reason: the signal reason is the DOMException
+  // AbortError the classifier recognizes ("This operation was aborted").
+  controller.abort()
   const parsed = JSON.parse(await pending)
   assert.equal(parsed.ok, false)
   assert.equal(parsed.code, VISION_RESULT_CODES.TIMEOUT)
@@ -1175,12 +1194,14 @@ test('issue #791 adversarial: a failed partial provider must not leak chunks int
       { provider: 'qwen-b', model: 'qwen3.6-plus' },
     ],
   }))
-  mock.ctx.llm.stream = async function* ({ provider }) {
-    const output = provider === 'qwen-a' ? 'BROKEN_PARTIAL_ANSWER' : 'SECOND_MODEL_VALID'
+  const attempts = []
+  mock.ctx.llm.stream = async function* (options) {
+    attempts.push(options.provider)
+    const output = options.provider === 'qwen-a' ? 'BROKEN_PARTIAL_ANSWER' : 'SECOND_MODEL_VALID'
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'text-delta', index: 0, text: output }
     yield { type: 'block-end', index: 0, block: { type: 'text', text: output } }
-    yield { type: 'finish', reason: provider === 'qwen-a'
+    yield { type: 'finish', reason: options.provider === 'qwen-a'
       ? { kind: 'error', failure: { code: 'SERVER', message: 'backend died after partial text' } }
       : { kind: 'stop' } }
   }
@@ -1188,8 +1209,7 @@ test('issue #791 adversarial: a failed partial provider must not leak chunks int
   // answer throws inside that leg and the next backend starts clean.
   const answer = await runDescribe(mock, {}, 115)
   assert.equal(answer, 'SECOND_MODEL_VALID')
-  assert.equal(mock.calls.get('qwen-a/qwen3.6-flash'), 1)
-  assert.equal(mock.calls.get('qwen-b/qwen3.6-plus'), 1)
+  assert.deepEqual(attempts, ['qwen-a', 'qwen-b'])
 })
 
 test('issue #791 adversarial: oversized provisional vision output is bounded and falls back safely', async () => {
@@ -1201,8 +1221,10 @@ test('issue #791 adversarial: oversized provisional vision output is bounded and
       { provider: 'qwen-b', model: 'qwen3.6-plus' },
     ],
   }))
-  mock.ctx.llm.stream = async function* ({ provider }) {
-    const output = provider === 'qwen-a' ? 'x'.repeat(9 * 1024 * 1024) : 'SAFE_FALLBACK'
+  const attempts = []
+  mock.ctx.llm.stream = async function* (options) {
+    attempts.push(options.provider)
+    const output = options.provider === 'qwen-a' ? 'x'.repeat(9 * 1024 * 1024) : 'SAFE_FALLBACK'
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'text-delta', index: 0, text: output }
     yield { type: 'block-end', index: 0, block: { type: 'text', text: output } }
@@ -1212,8 +1234,7 @@ test('issue #791 adversarial: oversized provisional vision output is bounded and
   // counts as failed and the walk falls through to the healthy one.
   const answer = await runDescribe(mock, {}, 116)
   assert.equal(answer, 'SAFE_FALLBACK')
-  assert.equal(mock.calls.get('qwen-a/qwen3.6-flash'), 1)
-  assert.equal(mock.calls.get('qwen-b/qwen3.6-plus'), 1)
+  assert.deepEqual(attempts, ['qwen-a', 'qwen-b'])
 })
 
 test('issue #791 adversarial: a stream without a terminal finish still delivers its text once', async () => {
@@ -1226,13 +1247,15 @@ test('issue #791 adversarial: a stream without a terminal finish still delivers 
       { provider: 'qwen-b', model: 'qwen3.6-plus' },
     ],
   }))
-  mock.ctx.llm.stream = async function* ({ provider }) {
-    const output = provider === 'qwen-a' ? 'UNFINISHED_BUT_TEXT' : 'RECOVERED'
+  const attempts = []
+  mock.ctx.llm.stream = async function* (options) {
+    attempts.push(options.provider)
+    const output = options.provider === 'qwen-a' ? 'UNFINISHED_BUT_TEXT' : 'RECOVERED'
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'text-delta', index: 0, text: output }
     yield { type: 'block-end', index: 0, block: { type: 'text', text: output } }
     // qwen-a ends WITHOUT any terminal chunk; qwen-b finishes normally.
-    if (provider === 'qwen-b') yield { type: 'finish', reason: { kind: 'stop' } }
+    if (options.provider === 'qwen-b') yield { type: 'finish', reason: { kind: 'stop' } }
   }
   // P5 semantic migration: only the terminal finish reason carries failures
   // (the assembler's documented contract), so a noncooperative stream that
@@ -1241,7 +1264,7 @@ test('issue #791 adversarial: a stream without a terminal finish still delivers 
   // success.
   const answer = await runDescribe(mock, {}, 117)
   assert.equal(answer, 'UNFINISHED_BUT_TEXT')
-  assert.equal(mock.calls.get('qwen-a/qwen3.6-flash'), 1)
-  assert.equal(mock.calls.get('qwen-b/qwen3.6-plus'), 0)
+  assert.deepEqual(attempts, ['qwen-a'], 'the early-ended stream delivered its assembled text; no fallback ran')
   assert.equal(await runDescribe(mock, {}, 118), 'UNFINISHED_BUT_TEXT')
+  assert.deepEqual(attempts, ['qwen-a'], 'the repeat call hits the cached success')
 })

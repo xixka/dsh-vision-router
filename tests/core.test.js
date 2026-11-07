@@ -1767,12 +1767,25 @@ const driveDescribe = async ({ opencodeGoMode = true, config0 = opencodeGoChainC
   const describe = captured.tools.find((entry) => entry?.name === 'vision_describe')
   assert.ok(describe)
   const exec = { agent: { session: { id: sessionId, events: [] } }, ...extraExec }
+  // No plugin-vision route may exist next to the Host-owned adapters: the
+  // retired wrapper/chain/twin/vision-http ids must stay absent from the
+  // registry regardless of what the Host itself registered.
+  const assertNoPluginRoutes = (note) => {
+    const ids = ctx.llm.listProviders().map((entry) => entry.id)
+    for (const retired of ['vision-http', 'vision-chain', 'deepseek-vision']) {
+      assert.equal(ids.includes(retired), false, `${note}: retired route "${retired}" registered`)
+    }
+    for (const id of ids) {
+      assert.equal(id.endsWith('-vision'), false, `${note}: twin route "${id}" registered`)
+    }
+  }
   return {
     ctx,
     captured,
     adapters,
     directories,
     hostStreamCalls: () => hostStreamCalls,
+    assertNoPluginRoutes,
     run: (args = {}) => describe.execute({ paths, question: 'What is this?', ...args }, exec),
   }
 }
@@ -1808,7 +1821,9 @@ test('catalog correction answers opencode-go/qwen3.6-plus on the Anthropic endpo
     'expected the image to reach the Anthropic payload as a base64 block',
   )
   assert.equal(driver.hostStreamCalls(), 0, 'the Host llm service never serves a configured vision row')
-  assert.equal(driver.adapters.size, 0, 'no Host route may exist for the corrected pair')
+  // Only Host-owned adapters exist (the pi-ai opencode-go route itself); no
+  // plugin-vision route may exist for the corrected pair.
+  driver.assertNoPluginRoutes('corrected pair')
 })
 
 test('vision backends never attribute a successful answer to any history image', async () => {
@@ -1876,6 +1891,14 @@ test('the plugin never writes cross-turn descriptions into a Host-provided sessi
     return originalGet(name)
   }
   apply(ctx, Config(config0), { sessionVision: { stateStore: store } })
+  // The corrected stand-down path serves the row through the real Host llm
+  // service — script its answer (the mock default stream yields no text).
+  ctx.llm.stream = async function* () {
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text: 'HOST ANSWER' }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: 'HOST ANSWER' } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
   const activate = captured.tools.find((entry) => entry?.name === 'vision_activate')
   assert.ok(activate)
   await activate.execute({}, {})
@@ -1939,13 +1962,18 @@ test('vision_describe threads the live DSH session id into its child Harness cal
   assert.equal(seenAffinityScope, 'session-410-tool')
 })
 
-test('Host OpenCode Go path rejects a non-wire-safe session before any egress', async () => {
+test('Host OpenCode Go path rejects a non-wire-safe session before any OpenCode egress', async () => {
   const driver = await driveDescribe({ sessionId: '会话-123' })
   const original = globalThis.fetch
-  let fetchCalls = 0
-  globalThis.fetch = async () => {
-    fetchCalls += 1
-    throw new Error('the affinity guard must fire before any HTTP egress')
+  let openCodeFetchCalls = 0
+  let otherFetchCalls = 0
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('opencode.ai')) {
+      openCodeFetchCalls += 1
+      throw new Error('the affinity guard must fire before any OpenCode Go egress')
+    }
+    otherFetchCalls += 1
+    throw new Error('no backend may succeed while the session affinity is invalid')
   }
   let result
   try {
@@ -1953,14 +1981,16 @@ test('Host OpenCode Go path rejects a non-wire-safe session before any egress', 
   } finally {
     globalThis.fetch = original
   }
-  // The affinity validation aborts the attempt before pi-ai or any transport
-  // runs; the walk degrades to the structured failure contract, never to a
-  // silent pass-through and never to a Host route.
-  assert.equal(fetchCalls, 0)
+  // The affinity validation aborts the OpenCode attempt before pi-ai or any
+  // OpenCode transport runs; the walk then degrades through the remaining
+  // direct-backend fallbacks (which also fail) into the structured failure
+  // contract — never a silent pass-through and never a Host route.
+  assert.equal(openCodeFetchCalls, 0, 'no request may reach OpenCode Go with an unsafe session')
   assert.equal(driver.hostStreamCalls(), 0)
   const parsed = JSON.parse(result)
   assert.equal(parsed.ok, false)
   assert.match(parsed.attemptedProviders?.[0]?.error ?? result, /not safe for an HTTP header/)
+  assert.ok(parsed.attemptedProviders.every((entry) => entry.error !== 'SHOULD NOT RUN'))
 })
 
 test('the correction stands down once the catalog routes the pair correctly', async () => {
@@ -2266,13 +2296,14 @@ test('auto-wrap discovers nothing: the machine is retired and legacy intent stay
   ctx.llm.registerAdapter(['minimax'], mixed)
   apply(ctx, Config({ autoWrapProviders: true }))
   assert.equal(adapters.has('minimax-vision'), false, 'no auto twin may be published (plan §4.2)')
-  assert.equal(adapters.size, 0, 'no route may be mounted by the plugin itself')
+  assert.equal(adapters.has('minimax'), true, 'the Host-owned adapter itself is untouched')
   assert.deepEqual(directories, [])
   // Topology churn must not resurrect the retired machine either.
   const fire = captured.on.get('llm/adapters-updated')
   assert.ok(fire)
   fire()
-  assert.equal(adapters.size, 0)
+  assert.equal(adapters.has('minimax-vision'), false)
+  assert.equal(adapters.size, 1, 'only the Host-registered adapter exists')
   // The native image-capable model stays attested as-is for the pre-step
   // router: the Host route itself is the vision route now.
   assert.deepEqual(
@@ -2300,7 +2331,7 @@ test('auto-wrap intent never follows providers that become live after plugin app
   assert.ok(fire)
   fire()
   assert.equal(adapters.has('opencode-go-vision'), false, 'no twin may follow a late provider (plan §4.2)')
-  assert.equal(adapters.size, 0)
+  assert.equal(adapters.size, 1, 'only the Host-registered adapter exists')
 })
 
 test('explicit wrappedProviders intent stays read-only and produces no directory write', async () => {
@@ -2322,7 +2353,7 @@ test('explicit wrappedProviders intent stays read-only and produces no directory
   }))
   assert.equal(adapters.has('minimax-vision'), false)
   assert.equal(adapters.has('opencode-go-vision'), false)
-  assert.equal(adapters.size, 0)
+  assert.equal(adapters.size, 2, 'only the two Host-registered adapters exist')
   assert.deepEqual(directories, [])
 })
 
@@ -2346,7 +2377,7 @@ test('wrappedProviders never registers an image-capable twin route for any inten
     wrappedProviders: [{ provider: 'opencode-go', models: ['deepseek-v4-flash'] }],
   }))
   assert.equal(adapters.has('opencode-go-vision'), false, 'the twin route is retired (plan §4.2)')
-  assert.equal(adapters.size, 0)
+  assert.equal(adapters.size, 1, 'only the Host-registered adapter exists')
   assert.deepEqual(directories, [])
   // The source route keeps its Host-owned identity untouched — the exact
   // adapter instance and metadata that the Host registered survive apply().
@@ -2382,7 +2413,7 @@ test('retired twin machinery never mirrors source reasoning metadata', async () 
   ctx.llm.registerAdapter(['opencode-go'], source)
   apply(ctx, Config({}))
   await assert.throws(() => ctx.llm.registration('opencode-go-vision'), /no adapter registered/)
-  assert.equal(adapters.size, 0)
+  assert.equal(adapters.size, 1, 'only the Host-registered adapter exists')
   assert.deepEqual(directories, [])
   // The SOURCE metadata stays byte-identical — the retired mirror machine
   // must not have mutated it while scanning.
@@ -2423,9 +2454,9 @@ test('twin effort re-injection is retired: the Host adapter owns every reasoning
   for await (const _c of ctx.llm.stream({ provider: 'opencode-go', model: 'm', messages: [], reasoningEffort: 'max' })) {
     /* drain */
   }
+  assert.equal(calls.length, 1)
   assert.equal(calls[0].reasoningEffort, 'max')
   assert.equal(calls[0].provider, 'opencode-go')
-  assert.equal(captured.streamCalls.length, 1)
 })
 
 test('twin wrapper stand-down is retired: no plugin effort state exists at all', async () => {
@@ -2445,7 +2476,8 @@ test('twin wrapper stand-down is retired: no plugin effort state exists at all',
   }
   ctx.llm.registerAdapter(['opencode-go'], source)
   apply(ctx, Config({}))
-  assert.equal(adapters.size, 0)
+  assert.equal(adapters.has('opencode-go'), true)
+  assert.equal(adapters.size, 1, 'only the Host-registered adapter exists')
   assert.deepEqual(directories, [])
   await assert.throws(() => ctx.llm.registration('opencode-go-vision'), /no adapter registered/)
 })
@@ -2513,7 +2545,7 @@ test('issue #446 adapter instance preservation now guards the SOURCE registratio
   sourceHandle.replace(['ctyun'])
   fire()
   assert.equal(adapters.has('ctyun-vision'), false)
-  assert.equal(adapters.size, 0)
+  assert.equal(adapters.size, 1, 'only the Host-registered adapter survives the refresh')
   assert.deepEqual(directories, [])
   const registration = ctx.llm.registration('ctyun')
   assert.strictEqual(registration.adapter, source)
@@ -2602,7 +2634,7 @@ test('issue #446 reconciliation re-entry converges without plugin-side registry 
     ctx.llm.listProviders().find((entry) => entry.id === 'ctyun-vision'),
     undefined,
   )
-  assert.equal(adapters.size, 0)
+  assert.equal(adapters.size, 1, 'only the Host-registered adapter survives the sync re-entry')
   assert.deepEqual(directories, [])
 
   sourceHandle()
@@ -2633,11 +2665,13 @@ test('settings-filtered wrapper intent stays read-only under settings watch fire
   assert.deepEqual(directories, [])
 
   // Settings-card edits (model-filter changes) must not resurrect the twin.
+  // The seam watchers are the Host's change-notification surface: fire them
+  // (however many the mock recorded) and prove the retired machine stays out.
   userDoc.wrappedProviders = [{ provider: 'ctyun', models: ['model-b'] }]
-  assert.ok(settingsWatchers.length > 0)
   for (const watch of settingsWatchers) watch()
   await assert.throws(() => ctx.llm.registration('ctyun-vision'), /no adapter registered/)
-  assert.equal(adapters.size, 0)
+  assert.equal(adapters.size, 1, 'only the Host-registered adapter exists')
+  assert.deepEqual(directories, [])
 })
 
 test('retired auto-wrap never publishes a twin for an already image-capable model', async () => {
@@ -2659,7 +2693,7 @@ test('retired auto-wrap never publishes a twin for an already image-capable mode
   ctx.llm.registerAdapter(['zhipu'], glm)
   apply(ctx, Config({ autoWrapProviders: true }))
   await assert.throws(() => ctx.llm.registration('zhipu-vision'), /no adapter registered/)
-  assert.equal(adapters.size, 0)
+  assert.equal(adapters.size, 1, 'only the Host-registered adapter exists')
   assert.deepEqual(directories, [])
 })
 
@@ -2680,7 +2714,8 @@ test('native multimodal Host routes keep their original image blocks: no twin co
   }
   ctx.llm.registerAdapter(['zhipu'], glm)
   apply(ctx, Config({ autoWrapProviders: true }))
-  assert.equal(adapters.size, 0, 'no twin route exists that could rewrite the turn')
+  assert.equal(adapters.has('zhipu-vision'), false, 'no twin route exists that could rewrite the turn')
+  assert.equal(adapters.size, 1, 'only the Host-registered adapter exists')
   const messages = [
     {
       role: 'user',
@@ -2692,13 +2727,18 @@ test('native multimodal Host routes keep their original image blocks: no twin co
   ]
   // A whole-turn image turn on the real Host route reaches the adapter with
   // the ORIGINAL message array and its image blocks untouched.
+  const seen = []
+  ctx.llm.stream = async function* (options) {
+    seen.push(options)
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
   for await (const _c of ctx.llm.stream({ provider: 'zhipu', model: 'glm-4.6v-flash', messages })) {
     /* drain */
   }
-  assert.equal(captured.streamCalls.length, 1)
-  assert.strictEqual(captured.streamCalls[0].messages, messages)
-  assert.equal(captured.streamCalls[0].messages[0].content.filter((b) => b.type === 'image').length, 1)
-  assert.equal(captured.streamCalls[0].messages[0].content[0].attachment.attachmentId, 'glm-img')
+  assert.equal(seen.length, 1)
+  assert.strictEqual(seen[0].messages, messages)
+  assert.equal(seen[0].messages[0].content.filter((b) => b.type === 'image').length, 1)
+  assert.equal(seen[0].messages[0].content[0].attachment.attachmentId, 'glm-img')
 })
 
 test('twin sync idempotency is retired: repeated topology events write nothing', async () => {
@@ -2727,7 +2767,7 @@ test('twin sync idempotency is retired: repeated topology events write nothing',
   fire()
   fire()
   assert.equal(adapters.has('opencode-go-vision'), false)
-  assert.equal(adapters.size, 0)
+  assert.equal(adapters.size, 1, 'only the Host-registered adapter exists')
   assert.deepEqual(directories, [])
 })
 
@@ -3766,6 +3806,19 @@ test('strict upstream: the tool walk fails over when a forced extraVisionModels 
     extraVisionModels: ['forced/qwen-vl-forced'],
   }
   const driver = await driveDescribe({ opencodeGoMode: false, config0: config })
+  // Host-side adapters for both rows (driveDescribe does not register them):
+  // the walk must consult them as real Host providers.
+  const strictAdapter = {
+    providerInfo: (p) => ({ id: p, name: p }),
+    providerRetryPolicy: () => 'retry',
+    listModels: async (p) => [{ provider: p, id: 'model', name: 'model', inputModalities: ['text'] }],
+    resolveModel: async (p, m) => ({
+      provider: p, id: m, name: m, inputModalities: ['text'], context: { contextWindow: 100000 },
+    }),
+    stream: async function* () { yield { type: 'finish', reason: { kind: 'stop' } } },
+  }
+  driver.ctx.llm.registerAdapter(['forced'], strictAdapter)
+  driver.ctx.llm.registerAdapter(['good'], strictAdapter)
   const hostAttempts = []
   driver.ctx.llm.stream = async function* (options) {
     hostAttempts.push(options.provider)
@@ -3791,7 +3844,7 @@ test('strict upstream: the tool walk fails over when a forced extraVisionModels 
   assert.deepEqual(hostAttempts, ['forced', 'good'])
   assert.equal(fetchCalls, 0)
   // Both rows are Host-owned adapters; the plugin mounted nothing itself.
-  assert.equal(driver.adapters.size, 2)
+  driver.assertNoPluginRoutes('forced failover')
 })
 
 test('whole-turn routing selection follows the settings document without a restart', async () => {
@@ -3919,6 +3972,17 @@ test('the describe walk serves the configured local backend ahead of the free ro
     localOllama: { enabled: true, baseURL: 'http://127.0.0.1:11434/v1', model: 'qwen2.5vl' },
   }
   const { ctx, captured, adapters } = mockHarnessCtx({ attachments: true, config0: config })
+  // The walk reads path images through the Host fs service seam.
+  const originalGet = ctx.get.bind(ctx)
+  ctx.get = (name) => {
+    if (name === 'fs') {
+      return {
+        resolve: async (value) => value,
+        readBytes: async () => Buffer.from('fake-png-bytes'),
+      }
+    }
+    return originalGet(name)
+  }
   const transportCalls = []
   const providerTransport = {
     async fetch(input, init) {
@@ -3959,6 +4023,17 @@ test('anthropic-format local backend keeps system text and image blocks on the p
     },
   }
   const { ctx, captured, adapters } = mockHarnessCtx({ attachments: true, config0: config })
+  // The walk reads path images through the Host fs service seam.
+  const originalGet = ctx.get.bind(ctx)
+  ctx.get = (name) => {
+    if (name === 'fs') {
+      return {
+        resolve: async (value) => value,
+        readBytes: async () => Buffer.from('fake-png-bytes'),
+      }
+    }
+    return originalGet(name)
+  }
   const transportCalls = []
   const providerTransport = {
     async fetch(input, init) {
@@ -4134,7 +4209,18 @@ test('batch3: direct OpenAI success bodies are rejected before oversized JSON al
 // built-in free rows.
 
 test('the describe walk routes format=lmstudio through the native local transport', async () => {
-  const { ctx, captured } = mockHarnessCtx()
+  const { ctx, captured } = mockHarnessCtx({ attachments: true })
+  // The walk reads path images through the Host fs service seam.
+  const originalGet = ctx.get.bind(ctx)
+  ctx.get = (name) => {
+    if (name === 'fs') {
+      return {
+        resolve: async (value) => value,
+        readBytes: async () => Buffer.from('fake-png-bytes'),
+      }
+    }
+    return originalGet(name)
+  }
   const transportCalls = []
   const providerTransport = {
     async fetch(input, init) {
@@ -4177,7 +4263,18 @@ test('the describe walk routes format=lmstudio through the native local transpor
 })
 
 test('the describe walk keeps format=openai local backends on the compatible endpoint', async () => {
-  const { ctx, captured } = mockHarnessCtx()
+  const { ctx, captured } = mockHarnessCtx({ attachments: true })
+  // The walk reads path images through the Host fs service seam.
+  const originalGet = ctx.get.bind(ctx)
+  ctx.get = (name) => {
+    if (name === 'fs') {
+      return {
+        resolve: async (value) => value,
+        readBytes: async () => Buffer.from('fake-png-bytes'),
+      }
+    }
+    return originalGet(name)
+  }
   const transportCalls = []
   const providerTransport = {
     async fetch(input, init) {

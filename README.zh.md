@@ -22,7 +22,7 @@
 > **默认配置会让数据出网。** 使用云端视觉模型时，Vision Router 会将图片（或由它裁剪出的局部）、识图提示词及相关请求元数据发送给对应供应商。新安装默认开启 OVHcloud 匿名视觉兜底，因此“免费”和“免 Key”不等于离线。涉密、涉案、内部或其他受限材料请勿使用云端链路。详见[数据流向与严格纯本地配置](#数据流向与严格纯本地配置)。
 
 > [!WARNING]
-> **本开发线的破坏性变更（零 Provider / `/vision` 版本）：** 输入框旁的 **「👁 识图」按钮已移除**——识图模式完全由 `/vision` 指令控制（`/vision`、`/vision status`、`/vision on`、`/vision off`、带图片附件的 `/vision <问题>`）。插件**不再注册任何模型 Provider / Adapter 路由**：`deepseek-vision` 包装、`vision-chain`、自动生成的 `<provider>-vision` 孪生与 `vision-http` 伪 Provider 全部下线，模型选择器与 `/model` 重新只显示你真实的 Host 模型。包装时代的设置字段（`autoWrapProviders`、`wrappedProviders`、`wrapperRoute`、`chainRoute`、`stealth`）在首次加载时只读迁移；旧 Session 历史保持可读。隐私语义（含 `localOnlyVision`）不变。详见[从包装时代迁移与回滚](#从包装时代迁移与回滚)。正式可安装版本以 [GitHub Releases](https://github.com/ysr666/dsh-vision-router/releases/latest) 或 npm 为准。
+> **v3.1.4 稳定补丁候选版——零 Provider / `/vision` 版本：** 输入框旁的 **「👁 识图」按钮已移除**——识图模式完全由 `/vision` 指令控制（`/vision`、`/vision status`、`/vision on`、`/vision off`、带图片附件的 `/vision <问题>`）；插件**不再注册任何模型 Provider / Adapter 路由**：`deepseek-vision` 包装、`vision-chain`、自动生成的 `<provider>-vision` 孪生与 `vision-http` 伪 Provider 全部下线，模型选择器与 `/model` 重新只显示你真实的 Host 模型。包装时代的设置字段（`autoWrapProviders`、`wrappedProviders`、`wrapperRoute`、`chainRoute`、`stealth`）在首次加载时只读迁移；旧 Session 历史保持可读；隐私语义（含 `localOnlyVision`）不变。本版同时包含 v3.1.4 稳定性修复：跨插件脚本改动（#793）、空识别结果的视觉回退与整轮识图时限（#794）、Desktop 启动源码外泄回归检测（#795）与 canary 维护（#790）——**用户上报的 550/503 具体成因与 #792 截图根因仍未确认**。详见 [v3.1.4 发布说明](docs/releases/v3.1.4.md)与[从包装时代迁移与回滚](#从包装时代迁移与回滚)。正式可安装版本以 [GitHub Releases](https://github.com/ysr666/dsh-vision-router/releases/latest) 或 npm 为准。
 
 ## 先用起来
 
