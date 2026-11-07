@@ -12,6 +12,44 @@ export const DSH_VERIFICATION_EVIDENCE = Object.freeze({
   previewCanaryDistTag: 'alpha',
 })
 
+/**
+ * Hot-install / hot-upgrade support matrix (plan.md §6.2).
+ *
+ * The cells are honest by construction: unsupported operations never promise a
+ * hot effect, and every supported completion is defined by observed evidence
+ * (Host application, /vision discoverability, a bounded readiness check) —
+ * never by a CLI or pnpm exit code.
+ */
+export const HOT_INSTALL_SUPPORT_MATRIX = Object.freeze({
+  webInAppFirstInstall: Object.freeze({
+    supported: true,
+    requiresReadinessGate: false,
+    completionEvidence: "Host ChangeResult application='applied', /vision discoverable, health check green",
+  }),
+  externalCliFirstInstall: Object.freeze({
+    supported: true,
+    requiresReadinessGate: true,
+    completionEvidence: 'bounded readiness check (/vision status plus an image smoke); never the CLI exit code',
+  }),
+  externalCliOverwriteUpgrade: Object.freeze({
+    supported: false,
+    hotEffective: false,
+    completionEvidence: 'honestly reported as not hot-effective; no silent restart',
+  }),
+  desktopElectron: Object.freeze({
+    supported: false,
+    hotInstallable: false,
+    completionEvidence: 'not hot-installable; honest degraded path without a promise',
+  }),
+})
+
+/**
+ * Node major required for hot install specifically. Ordinary installation
+ * keeps its own, looser floor (package.json engines), which must stay in
+ * sync with the general support policy and is asserted in tests.
+ */
+export const HOT_INSTALL_NODE_MINIMUM = 24
+
 export function supportWindowUpgradeAdvice(capabilities = {}) {
   const batchAttachments = capabilities?.batchAttachments
   const maxImageDimension = capabilities?.maxImageDimension

@@ -3,7 +3,8 @@
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { doctorProfiles, resolveDshHome } from './doctor.js'
-import { inspectPlatform, probeRuntime, supportReport } from './doctor-runtime.js'
+import { inspectHotInstallReadiness, inspectPlatform, probeRuntime, supportReport } from './doctor-runtime.js'
+import { HOT_INSTALL_NODE_MINIMUM } from './dsh-support-window.js'
 import { inspectDoctorVisionLimits, formatDoctorVisionLimits } from './doctor-vision-limits.js'
 import { repairLegacySessionLogs } from './legacy-session-repair.js'
 
@@ -133,6 +134,7 @@ function formatIssueTemplate(report) {
     `- Settings save failures: ${number(report.log?.currentSettingsFailureCount)} current / ${number(report.log?.historicalSettingsFailureCount)} historical`,
     `- Known session issues: ${sessionState}`,
     `- Local optional tools: Tesseract ${typeof platform.tesseract?.version === 'string' ? 'detected' : 'not confirmed'}, Chromium ${typeof platform.chromium?.version === 'string' ? 'detected' : 'not confirmed'}`,
+    `- Hot-install readiness: ${report.hotInstall ? `${allowed(report.hotInstall.verdict, ['ready', 'degraded', 'blocked', 'not-inspected'])} (${number(report.hotInstall.reasons.length)} reason(s); Node gate >= ${report.hotInstall.nodeRequirement.replace('>= ', '')})` : 'not inspected'}`,
     '',
     '## Reproduction details (fill in)',
     '',
@@ -269,6 +271,19 @@ export async function run(argv = process.argv.slice(2), io = console, env = proc
     .filter((item) => item.installation?.applicable && item.profileDir)
     .map((item) => item.profileDir)
   const platform = inspectPlatform({ profileDirs: applicableDirs })
+  // Hot-install readiness is a capability report, never an install-health
+  // verdict: environments that cannot hot install are still healthy ordinary
+  // installations, so this section is advisory and must not affect the exit
+  // code. The Node gate is intentionally stricter than the install support
+  // window reported by `platform.nodeSupported`.
+  const hotInstall = applicableDirs.length > 0
+    ? inspectHotInstallReadiness({
+      profiles: profileReport.profiles
+        .filter((item) => item.installation?.applicable && item.profileDir)
+        .map((item) => ({ name: item.name, profileDir: item.profileDir })),
+      dshHome,
+    })
+    : undefined
   const visionLimits = inspectDoctorVisionLimits(profileReport.log?.file)
   let sessions
   if (options.sessions) sessions = repairLegacySessionLogs({ dshHome, fix: false })
@@ -278,7 +293,7 @@ export async function run(argv = process.argv.slice(2), io = console, env = proc
     && (!sessions || (sessions.affected === 0 && sessions.errors.length === 0))
 
   if (options.json || options.issueTemplate) {
-    const report = supportReport({ profileReport, runtime, platform, sessions })
+    const report = supportReport({ profileReport, runtime, platform, sessions, hotInstall })
     report.visionLimits = visionLimits
     report.ok = overallOk
     io.log(options.issueTemplate ? formatIssueTemplate(report) : JSON.stringify(report, null, 2))
@@ -323,6 +338,24 @@ export async function run(argv = process.argv.slice(2), io = console, env = proc
   for (const entry of platform.sharp ?? []) {
     const profileName = profileReport.profiles.find((profile) => entry.profileDir === profile.profileDir)?.name
     io.log(`${entry.package?.version ? '✓' : '–'} Sharp${profileName ? ` (${profileName})` : ''}${entry.package?.version ? ` — ${entry.package.version}` : ' — not found in profile (may be host-provided)'}`)
+  }
+
+  if (hotInstall) {
+    // The section is a capability report: '!' marks both degraded and
+    // blocked because neither is an installation-health failure.
+    io.log(`${hotInstall.verdict === 'ready' ? '✓' : '!'} Hot-install readiness — ${hotInstall.verdict}`)
+    io.log(`  ${hotInstall.nodeOk ? '✓' : '!'} Node ${platform.node} — hot-install minimum >= ${HOT_INSTALL_NODE_MINIMUM}${hotInstall.nodeOk ? '' : ' not met; ordinary installation stays supported, hot install does not'}`)
+    for (const entry of hotInstall.profiles) {
+      const stageFlags = Object.entries(entry.stages).map(([stage, verified]) => `${stage}: ${verified ? 'yes' : 'no'}`).join(', ')
+      const entryMarker = entry.verdict === 'ready' ? '✓' : '!'
+      io.log(`  ${entryMarker} ${entry.profile} — ${entry.verdict} (${stageFlags})`)
+      if (entry.nativeAbi.sharpVersion !== undefined) {
+        io.log(`    Sharp ABI — ${entry.nativeAbi.compatible ? `${entry.nativeAbi.sharpVersion} Node-API prebuilds (ABI-stable across Node versions)` : `${entry.nativeAbi.sharpVersion} ${entry.nativeAbi.reason}`}`)
+      }
+      io.log(`    HMR — ${entry.hmr.status === 'disabled' ? 'disabled by a user layer; profile changes apply only after a Host restart' : 'enabled by the dsh-base bundle default; the final composition is Host-decided'}`)
+      for (const conflict of entry.conflicts) io.error(`    ✗ ${conflict}`)
+      for (const reason of entry.reasons) io.log(`    ! ${reason}`)
+    }
   }
 
   if (sessions) {

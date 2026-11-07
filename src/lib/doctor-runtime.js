@@ -1,9 +1,11 @@
 import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import os, { homedir } from 'node:os'
 import path from 'node:path'
 import { CURRENT_VERSION } from './update-check.js'
 import { DOCTOR_RESPONSE_MAX_BYTES, readResponseTextBounded } from './http-body-limit.js'
+import { HOT_INSTALL_NODE_MINIMUM } from './dsh-support-window.js'
+import { checkHmrAvailability, inspectInstallReadiness } from './plugin-hot-install-readiness.js'
 
 export const DEFAULT_RUNTIME_URL = 'http://127.0.0.1:3080'
 const SAFE_RUNTIME_ROUTES = [
@@ -256,6 +258,72 @@ export function inspectPlatform({ profileDirs = [], env = process.env } = {}) {
   }
 }
 
+const PATCH_INPUT_MAX_BYTES = 1024 * 1024
+
+function readPatchTextBounded(filePath) {
+  try {
+    const stats = statSync(filePath)
+    if (!stats.isFile() || stats.size > PATCH_INPUT_MAX_BYTES) return undefined
+    return readFileSync(filePath, 'utf8')
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Doctor-level hot-install readiness (plan.md §6.1 / §6.2): per applicable
+ * profile the three-state inspection plus the offline HMR composition check.
+ *
+ * The result is diagnostic-only and honest: unsupported environments are
+ * reported as 'blocked' or 'degraded' with explicit reasons, and nothing here
+ * may flip the doctor exit code — an environment that cannot hot install can
+ * still be a perfectly healthy ordinary installation.
+ */
+export function inspectHotInstallReadiness({
+  profiles = [],
+  dshHome,
+  nodeVersion = process.versions.node,
+} = {}) {
+  const entries = []
+  for (const profile of profiles) {
+    const profileDir = typeof profile?.profileDir === 'string' ? profile.profileDir : undefined
+    if (profileDir === undefined || profileDir === '') continue
+    const inspection = inspectInstallReadiness({ profileDir, nodeVersion })
+    const hmr = checkHmrAvailability({
+      profilePatch: readPatchTextBounded(path.join(profileDir, 'cordis.patch.yml')),
+      homePatch: typeof dshHome === 'string' ? readPatchTextBounded(path.join(dshHome, 'cordis.patch.yml')) : undefined,
+    })
+    let verdict = inspection.verdict
+    const reasons = [...inspection.reasons]
+    if (hmr.status === 'disabled') {
+      if (verdict === 'ready') verdict = 'degraded'
+      reasons.push(hmr.reason)
+    }
+    entries.push(Object.freeze({
+      profile: profile.name,
+      stages: inspection.stages,
+      conflicts: inspection.conflicts,
+      nativeAbi: inspection.nativeAbi,
+      nodeOk: inspection.nodeOk,
+      hmr,
+      verdict,
+      reasons: Object.freeze(reasons),
+    }))
+  }
+
+  const verdict = entries.length === 0 ? 'not-inspected'
+    : entries.some((entry) => entry.verdict === 'blocked') ? 'blocked'
+      : entries.some((entry) => entry.verdict === 'degraded') ? 'degraded'
+        : 'ready'
+  return Object.freeze({
+    nodeRequirement: `>= ${HOT_INSTALL_NODE_MINIMUM}`,
+    nodeOk: entries.length > 0 && entries.every((entry) => entry.nodeOk),
+    profiles: Object.freeze(entries),
+    verdict,
+    reasons: Object.freeze(entries.flatMap((entry) => entry.reasons.map((reason) => `${entry.profile}: ${reason}`))),
+  })
+}
+
 export function redactPath(value, home = homedir()) {
   if (typeof value !== 'string') return value
   const normalizedHome = path.resolve(home)
@@ -330,7 +398,7 @@ function safeRuntime(runtime) {
   }
 }
 
-export function supportReport({ profileReport, runtime, platform, sessions }) {
+export function supportReport({ profileReport, runtime, platform, sessions, hotInstall }) {
   const safeProfiles = profileReport.profiles.map((item) => ({
     name: item.name,
     exists: item.exists,
@@ -390,5 +458,15 @@ export function supportReport({ profileReport, runtime, platform, sessions }) {
         packages: entry.packages,
       })),
     },
+    // Hot-install readiness is name-keyed by construction: entries carry
+    // profile names and static reasons only, never profile directories or
+    // other local paths.
+    hotInstall: hotInstall ? {
+      nodeRequirement: hotInstall.nodeRequirement,
+      nodeOk: hotInstall.nodeOk,
+      verdict: hotInstall.verdict,
+      reasons: hotInstall.reasons,
+      profiles: hotInstall.profiles,
+    } : undefined,
   }
 }
