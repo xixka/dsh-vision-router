@@ -426,8 +426,10 @@ test('tracker escalates to SIGKILL when a child ignores SIGTERM', async () => {
 test('bindGenerationResources owns disposal through ctx.effect and reports when it cannot', () => {
   const disposers = []
   const ctx = {
+    // Real Cordis semantics: effect(callback) runs the callback immediately
+    // and keeps its return value as the teardown disposer.
     effect(fn, label) {
-      disposers.push({ fn, label })
+      disposers.push({ disposer: fn(), label })
       return () => {}
     },
   }
@@ -436,6 +438,10 @@ test('bindGenerationResources owns disposal through ctx.effect and reports when 
   assert.equal(bound.tracker.generation, 3)
   assert.equal(disposers.length, 1)
   assert.match(disposers[0].label, /generation 3 reload resources/)
+  assert.equal(typeof disposers[0].disposer, 'function', 'the effect callback must return the disposer instead of running disposeAll at bind time')
+  // Tracking still works after binding: disposal has not run yet.
+  bound.tracker.track({ kind: 'timer', dispose: () => {} })
+  assert.equal(bound.tracker.active().length, 1)
   const orphan = bindGenerationResources({}, { generation: 4 })
   assert.equal(orphan.effectOwned, false, 'without ctx.effect the caller owns disposeAll explicitly')
 })

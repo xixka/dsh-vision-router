@@ -92,20 +92,35 @@ test('mock: generation tracker disposes exactly its own native-like children', a
   // The disposal promise resolved only after the actual process exit.
   assert.ok(tracked.exitCode !== null || tracked.signalCode !== null, 'tracked child must have exited')
   assert.ok(isAlive(untracked.pid), 'an untracked child of another owner must never be touched')
+  // Listener before kill: once('exit') registered after an already-exited
+  // child never fires.
+  const untrackedExit = new Promise((resolve) => untracked.once('exit', resolve))
   untracked.kill('SIGKILL')
-  await new Promise((resolve) => untracked.once('exit', resolve))
+  await untrackedExit
 })
 
 test('mock: bindGenerationResources owns disposal through ctx.effect', async () => {
+  // Real Cordis semantics: effect(callback) invokes the callback immediately
+  // and keeps its return value as the teardown disposer.
   let effectDisposer = null
   const ctx = { effect: (register) => { effectDisposer = register() } }
   const bound = bindGenerationResources(ctx, { generation: 7 })
   assert.equal(bound.effectOwned, true)
   const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
-  bound.tracker.trackChildProcess(child)
-  assert.equal(typeof effectDisposer, 'function')
-  await effectDisposer()
-  assert.ok(child.exitCode !== null || child.signalCode !== null, 'generation teardown must dispose the child')
+  try {
+    bound.tracker.trackChildProcess(child)
+    assert.equal(typeof effectDisposer, 'function', 'the effect callback must return the disposer, not invoke disposal at bind time')
+    await effectDisposer()
+    assert.ok(child.exitCode !== null || child.signalCode !== null, 'generation teardown must dispose the child')
+  } finally {
+    // Attach the exit listener BEFORE killing: once('exit') registered after
+    // an already-exited child never fires and awaits forever.
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolve) => child.once('exit', resolve))
+      child.kill('SIGKILL')
+      await exited
+    }
+  }
 
   const unbound = bindGenerationResources({}, { generation: 8 })
   assert.equal(unbound.effectOwned, false, 'without ctx.effect the caller owns disposeAll — reported, not hidden')
@@ -221,8 +236,15 @@ test('mock: explicit cancel covers only vision-router agents; the unrelated agen
 
 test('mock: failed candidate rollback leaves the unrelated plugin serving', async () => {
   const host = makeMockHost()
+  // This scenario starts from a drained vision-router (its busy agent already
+  // finished): the busy-drain boundary itself is covered by the two tests
+  // above. Here the pipeline must reach execution, fail verification, and
+  // recover from the snapshot while the unrelated plugin never notices.
+  host.agents.find((item) => item.id === 'vision-agent-1').busy = false
   const coordinator = createHotUpgradeCoordinator({
     ...makeSharedServicesAdapters(host, { executeBreaksDvr: true }),
+    sleep: async () => {},
+    drainTimeoutMs: 20,
   })
   const result = await coordinator.upgrade({})
   assert.equal(result.state, 'recovered', JSON.stringify(result))

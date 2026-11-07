@@ -229,8 +229,12 @@ export function bindGenerationResources(ctx, { generation = 0, logger, exitTimeo
   const tracker = createGenerationResourceTracker(generation, { logger, exitTimeoutMs })
   const ownsEffect = typeof ctx?.effect === 'function'
   if (ownsEffect) {
+    // Cordis ctx.effect(callback, label) runs the callback immediately and
+    // treats its return value as the disposer for this generation's teardown.
+    // disposeAll must therefore be returned, not invoked, here: invoking it
+    // would dispose the tracker at bind time, before any resource is tracked.
     ctx.effect(
-      () => tracker.disposeAll(),
+      () => () => tracker.disposeAll(),
       `vision-router: generation ${generation} reload resources`,
     )
   }
