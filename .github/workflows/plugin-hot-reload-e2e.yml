@@ -18,6 +18,7 @@ on:
       - 'cordis.patch.yml'
       - 'package.json'
       - 'pnpm-lock.yaml'
+      - 'scripts/build-source-artifacts.mjs'
       - 'tests/plugin-hot-upgrade-coordinator.test.js'
       - 'tests/plugin-hot-shared-services.e2e.test.js'
       - 'tests/plugin-hot-reload.e2e.test.js'
@@ -30,6 +31,10 @@ on:
       - 'cordis.patch.yml'
       - 'package.json'
       - 'pnpm-lock.yaml'
+      - 'scripts/build-source-artifacts.mjs'
+      - 'tests/plugin-hot-upgrade-coordinator.test.js'
+      - 'tests/plugin-hot-shared-services.e2e.test.js'
+      - 'tests/plugin-hot-reload.e2e.test.js'
 
 permissions:
   contents: read
