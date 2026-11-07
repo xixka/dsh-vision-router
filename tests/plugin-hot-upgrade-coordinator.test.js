@@ -210,13 +210,19 @@ test('require-explicit-cancel without a confirmation aborts and names the requir
 
 test('require-explicit-cancel with a confirmation proceeds and records the cancellation', async () => {
   const pendingById = new Map([['agent-7', { id: 'agent-7', kind: 'vision' }]])
+  const drainCalls = []
   const adapters = makeAdapters({
-    drainActiveAgents: async (request, { cancelIds } = {}) => {
+    drainActiveAgents: async (request, { cancelIds = [] } = {}) => {
+      drainCalls.push({ cancelIds: [...cancelIds] })
       for (const id of cancelIds) pendingById.delete(id)
       return { pending: [...pendingById.values()], drained: [] }
     },
   })
-  const coordinator = makeCoordinator(adapters)
+  const coordinator = makeCoordinator(adapters, {
+    drainTimeoutMs: 10,
+    drainPollIntervalMs: 1,
+    sleep: async () => {},
+  })
   const result = await coordinator.upgrade({
     drainPolicy: 'require-explicit-cancel',
     cancelConfirmations: ['agent-7'],
@@ -225,7 +231,7 @@ test('require-explicit-cancel with a confirmation proceeds and records the cance
   assert.equal(result.state, HOT_UPGRADE_STATES.COMMITTED)
   assert.deepEqual(result.drain.cancelledIds, ['agent-7'])
   assert.equal(result.drain.replayedRequests, 0)
-  const cancelCall = adapters.calls.drain.find((call) => call.cancelIds.length > 0)
+  const cancelCall = drainCalls.find((call) => call.cancelIds.length > 0)
   assert.ok(cancelCall, 'the drain adapter must observe the explicit cancel')
   assert.deepEqual(cancelCall.cancelIds, ['agent-7'])
 })
@@ -353,9 +359,10 @@ test('ten consecutive upgrade/reset cycles keep exactly one /vision and one tool
     },
     disposeGeneration() {
       disposedGenerations += 1
-      for (const dispose of [...commands.values()]) dispose()
+      // rc.5 NamedEntries semantics: the host disposes the previous
+      // generation's registrations (each register() disposer runs) before the
+      // next generation applies.
       commands.clear()
-      for (const dispose of [...tools.values()]) dispose()
       tools.clear()
     },
   }
@@ -487,6 +494,9 @@ async function stubValidator(overrides = {}) {
     probeImport: async () => ({ ok: true }),
     resolveInstalledEntry: () => '/staging/entry.js',
     stagingEnv: (home) => ({ DSH_HOME: home }),
+    // The validator runs against a candidate dir that exists only in CI/e2e;
+    // unit tests always stub the manifest reader.
+    readManifest: () => ({ name: 'dsh-vision-router', version: '3.2.0-rc.1', main: 'lib/public-entry.js' }),
     ...overrides,
   })
 }

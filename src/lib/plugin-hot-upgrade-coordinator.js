@@ -323,7 +323,7 @@ export function runDshPluginCommand({
  */
 export function createSubprocessImportProbe({ node = process.execPath, spawnImpl = spawn, timeoutMs = 60_000 } = {}) {
   return (entryUrl, { env } = {}) => new Promise((resolve) => {
-    const child = spawnImpl(node, ['--input-type=module', '-e', 'await import(process.argv[1])'], {
+    const child = spawnImpl(node, ['--input-type=module', '-e', 'await import(process.argv[1])', entryUrl], {
       env: env ?? process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
