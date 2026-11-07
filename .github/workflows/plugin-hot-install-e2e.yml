@@ -1,0 +1,87 @@
+name: Plugin hot-install e2e (real DSH 0.2.1-rc.5)
+
+# 首次安装事务与 Web/CLI 热安装 E2E（plan §8.1）：在 runner 上起真实
+# DSH 0.2.1-rc.5 Host（Node 子进程 spawn + 真实 Chromium 客户端），
+# 验证运行中安装不重启进程（PID/端口不变）、/vision 可发现、连续 2 次
+# 安装幂等、坏 bundle 失败注入后旧插件仍按报告语义处理。
+# 本工作流不包含任何 Desktop/Electron 路径。
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/plugin-hot-install.e2e.test.js'
+      - 'package.json'
+      - '.github/workflows/plugin-hot-install-e2e.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hot-install-e2e:
+    name: real Host hot-install e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout Vision Router
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: dvr
+      - name: Checkout immutable DSH 0.2.1-rc.5 source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: b830ec950faba0a46dda564be3e2d854afed94f1
+          persist-credentials: false
+          path: dsh-021-rc5
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.28.5
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+          cache-dependency-path: dsh-021-rc5/pnpm-lock.yaml
+      - name: Materialize Vision Router package artifacts
+        working-directory: dvr
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm build
+          pnpm build:check
+      - name: Pack the plugin tarball the Host will install
+        working-directory: dvr
+        run: |
+          pnpm pack --pack-destination tmp-pack
+          TARBALL="$(find tmp-pack -maxdepth 1 -name 'dsh-vision-router-*.tgz' -print -quit)"
+          test -n "$TARBALL"
+          echo "DVR_TARBALL=$(pwd)/$TARBALL" >> "$GITHUB_ENV"
+      - name: Install DSH workspace dependencies
+        working-directory: dsh-021-rc5
+        run: pnpm install --frozen-lockfile
+      - name: Build exact Host runtime
+        working-directory: dsh-021-rc5
+        run: pnpm run build
+      - name: Install Chromium for the real web client
+        working-directory: dsh-021-rc5
+        run: pnpm --filter @deepseek-ai/dsh-web-frontend exec playwright install --with-deps chromium
+      - name: Run hot-install e2e against the real Host
+        working-directory: dvr
+        env:
+          DSH_SOURCE_ROOT: ${{ github.workspace }}/dsh-021-rc5
+          DVR_SOURCE_ROOT: ${{ github.workspace }}/dvr
+          DSH_EXPECTED_VERSION: 0.2.1-rc.5
+          DVR_TARBALL: ${{ env.DVR_TARBALL }}
+          DVR_E2E_DIAGNOSTIC_PATH: ${{ runner.temp }}/plugin-hot-install-e2e-host.log
+        run: node --test tests/plugin-hot-install-e2e.test.js
+      - name: Upload hot-install diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plugin-hot-install-e2e-host-log
+          path: ${{ runner.temp }}/plugin-hot-install-e2e-host.log
+          if-no-files-found: ignore
+          retention-days: 2
