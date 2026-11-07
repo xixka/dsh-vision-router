@@ -237,14 +237,28 @@ test('P5: legacy shorthand migration is unaffected by the retired routing fields
     },
   }))
   // The shorthand providers row migrates exactly as it would without the
-  // retired fields, and every later op stays an unset (whether the engine
-  // tolerates them as read-only data today or retires them explicitly later):
-  // the visible providers chain is never rewritten because of them.
+  // retired fields, and no later op — set or unset — ever touches the
+  // visible providers chain.
   assert.deepEqual(ops[0], {
     op: 'set',
     path: ['providers'],
     value: [{ provider: 'openrouter', model: 'qwen-vl', fallbacks: [] }],
   })
+  assert.equal(ops.slice(1).some((op) => op.path[0] === 'providers'), false)
   assert.equal(ops.slice(1).every((op) => op.op === 'unset'), true)
-  assert.equal(ops.some((op) => op.op !== 'unset' && op.path[0] === 'providers'), false)
+  // t15 finalization: each retired routing field present in the user layer
+  // now carries exactly one unset op after the legacy-chain unsets, so the
+  // stored layer drops them and the new settings UI never shows them again.
+  assert.deepEqual(
+    ops.slice(1).map((op) => op.path[0]),
+    [
+      'provider',
+      'model',
+      'autoWrapProviders',
+      'wrappedProviders',
+      'wrapperRoute',
+      'chainRoute',
+      'stealth',
+    ],
+  )
 })

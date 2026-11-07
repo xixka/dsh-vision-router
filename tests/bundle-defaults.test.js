@@ -429,7 +429,6 @@ test('audited browser integration modules always trigger every real browser and 
   ]
   const boundaries = [
     'src/lib/client-host-compat-prelude.js',
-    'src/lib/guide-vision-toggle-highlight.js',
     'src/lib/remote-settings-risk-confirmation.js',
     'src/lib/settings-client-loader-lifecycle.js',
     'src/lib/settings-factory-lifecycle.js',
@@ -445,24 +444,6 @@ test('audited browser integration modules always trigger every real browser and 
     for (const path of boundaries) {
       const trigger = `      - '${path}'`
       assert.equal(source.split(trigger).length - 1, 2, `${name}: ${path} must trigger PR and main`)
-    }
-  }
-})
-
-test('model visibility boundary changes always trigger the real browser and alpha source gates', async () => {
-  const workflows = [
-    'dsh-preview-browser-smoke.yml',
-    'alpha-browser-cold-toggle-smoke.yml',
-    'dsh-alpha-source-contract.yml',
-  ]
-  for (const name of workflows) {
-    const source = await readFile(new URL(`../.github/workflows/${name}`, import.meta.url), 'utf8')
-    for (const path of [
-      'src/lib/vision-model-visibility-boundary-main.js',
-      'src/lib/vision-model-visibility-boundary.js',
-    ]) {
-      const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      assert.equal((source.match(new RegExp(escaped, 'g')) ?? []).length, 2, `${name}: ${path} must trigger PR and main`)
     }
   }
 })

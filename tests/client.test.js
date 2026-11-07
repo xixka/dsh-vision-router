@@ -1466,7 +1466,9 @@ test('presented image resource cache disposal rejects late loads without creatin
 test('a presented image card brings itself into view instead of waiting to be scrolled back to', async () => {
   const { CLIENT_PRESENTATION_PRELUDE } = await import('../lib/client-presentation-boundary.js')
   const start = CLIENT_PRESENTATION_PRELUDE.indexOf('function focusPresentedCard(node, viewportHeight) {')
-  const stop = CLIENT_PRESENTATION_PRELUDE.indexOf('function installVisionModeToggle(')
+  // After the t7 toggle retirement the presented-card focus section runs up to
+  // the paste-compat decorator instead of the deleted installVisionModeToggle.
+  const stop = CLIENT_PRESENTATION_PRELUDE.indexOf('function decorateVisionRouterPlugin(plugin) {')
   assert.ok(start > 0 && stop > start, 'the presented-card focus helper must exist in the prelude')
   const declaration = CLIENT_PRESENTATION_PRELUDE.slice(start, stop)
   // vm (not the Function constructor) keeps the scanner’s 'no eval/Function’ rule satisfied.
