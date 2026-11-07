@@ -188,7 +188,7 @@ test('checkNativeAbi verifies a loaded sharp module and Electron ABI targets', (
   )
   const mismatch = checkNativeAbi(loaded, { modules: runtimeAbi + 1 })
   assert.equal(mismatch.compatible, false)
-  assert.match(mismatch.reason, /native rebuild required/)
+  assert.match(mismatch.reason, /a native rebuild is required/)
 
   assert.throws(() => checkNativeAbi(loaded, 'electron'), TypeError)
 })
@@ -347,9 +347,11 @@ test('waitUntilReady reports an explicit timeout, bounded by the deadline and ne
   assert.equal(throwing.status, 'timeout')
   assert.deepEqual([...throwing.pending], ['hostApplied'])
 
-  assert.throws(() => waitUntilReady({}, { timeoutMs: -1, pollMs: 1 }), TypeError)
-  assert.throws(() => waitUntilReady({}, { timeoutMs: 'x', pollMs: 1 }), TypeError)
-  assert.throws(() => waitUntilReady({}, { timeoutMs: 10, pollMs: 0 }), TypeError)
+  // Argument validation of an async surface rejects rather than throwing
+  // synchronously; assert.rejects also keeps the promise observed.
+  await assert.rejects(waitUntilReady({}, { timeoutMs: -1, pollMs: 1 }), TypeError)
+  await assert.rejects(waitUntilReady({}, { timeoutMs: 'x', pollMs: 1 }), TypeError)
+  await assert.rejects(waitUntilReady({}, { timeoutMs: 10, pollMs: 0 }), TypeError)
 })
 
 test('doctor-level aggregation composes the three states, gates and HMR evidence', () => {
