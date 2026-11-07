@@ -390,7 +390,15 @@ async function assertPackageRowCount(name, expected, label) {
 }
 
 async function assertVisionSurfaceCount(expected, label) {
-  assert.equal(await visionSurfaceCount(ctx.page), expected, `${label}: /vision settings surface count`)
+  let count = await visionSurfaceCount(ctx.page)
+  if (count !== expected) {
+    // 当前页面可能早于安装事件（CLI 通道 watcher 只改 Host 状态）；一次整页
+    // 重载后的全新客户端加载才是 clientAvailable 的权威投影。
+    await ctx.page.reload({ waitUntil: 'domcontentloaded' })
+    await dismissFirstRunOverlays(ctx.page)
+    count = await visionSurfaceCount(ctx.page)
+  }
+  assert.equal(count, expected, `${label}: /vision settings surface count`)
 }
 
 test('real DSH 0.2.1-rc.5 Host boots cold with no DVR plugin installed', { timeout: 240_000 }, async (t) => {

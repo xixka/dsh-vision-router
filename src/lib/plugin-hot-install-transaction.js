@@ -248,15 +248,18 @@ export function createFirstInstallTransaction(options) {
     let change = null
     let cliResult = null
     if (channel === 'web') {
-      change = await options.channels.web.installBundle(options.spec, options.installOptions ?? {})
+      change = await Promise.resolve()
+        .then(() => options.channels.web.installBundle(options.spec, options.installOptions ?? {}))
         .catch((error) => ({ application: 'failed', error: { code: 'install-threw', message: String(error) } }))
       application = change?.application ?? (change?.changed === true ? 'applied' : 'overridden')
       if (application === 'applied' && change?.error) application = 'failed'
     } else {
-      cliResult = await options.channels.cli.run(options.spec).catch((error) => ({
-        exitCode: 1,
-        stderr: String(error),
-      }))
+      cliResult = await Promise.resolve()
+        .then(() => options.channels.cli.run(options.spec))
+        .catch((error) => ({
+          exitCode: 1,
+          stderr: String(error),
+        }))
       application = cliResult?.exitCode === 0 ? 'applied' : 'failed'
     }
     state.detail = `application:${application}`
