@@ -9,7 +9,8 @@ on:
   pull_request:
     paths:
       - 'src/**'
-      - 'tests/plugin-hot-install.e2e.test.js'
+      - 'scripts/build-source-artifacts.mjs'
+      - 'tests/plugin-hot-install-e2e.test.js'
       - 'package.json'
       - '.github/workflows/plugin-hot-install-e2e.yml'
 
