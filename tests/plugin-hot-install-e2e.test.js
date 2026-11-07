@@ -14,6 +14,9 @@
 //   5. 验证——/vision 可发现且无模型副作用；command/tool/settings 面唯一；
 //   6. 失败恢复——坏 bundle 包操作失败后按 DSH 快照恢复 manifest/lockfile，
 //      旧插件继续运行；进程全程不重启（PID/端口不变）。
+//
+// “/vision 可发现”取当前主线的产品面：Settings 对话框里唯一的一级
+// Vision Router 分区（composer 视觉开关已在 P5 退役，仅存于旧冒烟脚本）。
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
@@ -44,16 +47,13 @@ const ctx = {
   page: null,
   env: null,
   scratch: null,
-  workspacePath: null,
   hostOutput: '',
   modelRequestCount: 0,
 }
 
 function requireDsh() {
   const dshRequire = createRequire(join(dshRoot, 'package.json'))
-  const tsxLoader = dshRequire.resolve('tsx')
-  const cli = join(dshRoot, 'apps/cli/src/bin.ts')
-  return { tsxLoader, cli }
+  return { tsxLoader: dshRequire.resolve('tsx'), cli: join(dshRoot, 'apps/cli/src/bin.ts') }
 }
 
 function resolvePlaywright() {
@@ -87,13 +87,13 @@ function waitForReadyLine(child) {
 }
 
 async function dismissFirstRunOverlays(page) {
-  // DVR 自身的 onboarding 仅在插件加载后出现；DSH 首启公告两者都处理。
+  // DVR 自身的 onboarding 仅在插件客户端首次加载后出现；DSH 首启公告两者都处理。
   const vrOnboarding = page.locator('.vr-onboarding-backdrop')
   try {
     await vrOnboarding.waitFor({ state: 'visible', timeout: 5_000 })
   } catch (_) { /* absent: fine */ }
   if (await vrOnboarding.isVisible().catch(() => false)) {
-    await vrOnboarding.locator('.vr-onboarding-secondary').click()
+    await vrOnboarding.locator('.vr-onboarding-secondary, .vr-onboarding-close').first().click()
     await vrOnboarding.waitFor({ state: 'hidden', timeout: 15_000 })
   }
   const welcome = page.getByRole('dialog', { name: /^(?:Internal Testing Notice|Preview Notice)$/ }).first()
@@ -106,8 +106,41 @@ async function dismissFirstRunOverlays(page) {
   }
 }
 
-function visionToggleCount(page) {
-  return page.locator('[data-vision-router-mode-toggle="true"]').count()
+/** 打开 Settings 对话框（Settings 按钮或 Account 菜单回退，与现行 rc 冒烟一致）。 */
+async function openSettingsDialog(page) {
+  const settings = page.getByRole('button', { name: 'Settings', exact: true })
+  if (await settings.isVisible().catch(() => false)) {
+    await settings.click()
+  } else {
+    const accountMenu = page.getByRole('button', { name: /账号菜单|Account menu/i })
+    await accountMenu.waitFor({ state: 'visible', timeout: 30_000 })
+    await accountMenu.click()
+    await page.getByRole('menuitem', { name: /设置|Settings/i }).first().click()
+  }
+  const dialog = page.getByRole('dialog', { name: 'Settings' })
+  await dialog.waitFor({ state: 'visible', timeout: 15_000 })
+  return dialog
+}
+
+function visionSettingsNavCount(page) {
+  return page.getByRole('dialog', { name: 'Settings' })
+    .getByRole('button', { name: 'Vision Router', exact: true }).count()
+}
+
+/**
+ * /vision 客户端面计数：打开 Settings 对话框读取唯一一级 Vision Router 分区数，
+ * 读后关闭。插件未安装/未应用时为 0；无需任何会话或工作区导航。
+ */
+async function visionSurfaceCount(page) {
+  const alreadyOpen = await page.getByRole('dialog', { name: 'Settings' }).isVisible().catch(() => false)
+  if (alreadyOpen) return visionSettingsNavCount(page)
+  try {
+    await openSettingsDialog(page)
+    return await visionSettingsNavCount(page)
+  } finally {
+    await page.keyboard.press('Escape').catch(() => {})
+    await page.getByRole('dialog', { name: 'Settings' }).waitFor({ state: 'hidden', timeout: 5_000 }).catch(() => {})
+  }
 }
 
 function panelPackageCount(page, name) {
@@ -135,86 +168,6 @@ async function openPluginPanel(page) {
   return panel
 }
 
-async function adoptRealWorkspace(page, workspacePath) {
-  const chooseWorkspace = page.getByRole('button', { name: 'Choose workspace', exact: true })
-  await chooseWorkspace.waitFor({ state: 'visible', timeout: 30_000 })
-  await chooseWorkspace.click()
-  const picker = page.getByRole('dialog', { name: 'Select Workspace Directory', exact: true })
-  await picker.waitFor({ state: 'visible', timeout: 30_000 })
-  await picker.getByRole('button', { name: 'Edit path', exact: true }).click()
-  const pathInput = picker.getByRole('textbox', { name: 'Edit path', exact: true })
-  await pathInput.waitFor({ state: 'visible', timeout: 10_000 })
-  await pathInput.fill(workspacePath)
-  await pathInput.press('Enter')
-  await pathInput.waitFor({ state: 'hidden', timeout: 30_000 })
-  await picker.getByRole('button', { name: 'Open', exact: true }).click({ timeout: 30_000 })
-  await picker.waitFor({ state: 'hidden', timeout: 30_000 })
-}
-
-async function connectFreshWorkspaceThroughHero(page) {
-  // rc.5 官方 e2e support.ts 的 connectFreshWorkspace 同款路径：
-  // sessionless 英雄区的 'Choose workspace' 文本框 → Select Workspace Directory。
-  const heroInput = page.getByRole('textbox', { name: 'Choose workspace', exact: true })
-  if (!await heroInput.isVisible().catch(() => false)) return false
-  await heroInput.click()
-  const picker = page.getByRole('dialog', { name: 'Select Workspace Directory', exact: true })
-  await picker.waitFor({ state: 'visible', timeout: 10_000 })
-  await picker.getByRole('button', { name: 'Edit path', exact: true }).click()
-  const pathInput = picker.getByRole('textbox', { name: 'Edit path', exact: true })
-  await pathInput.waitFor({ state: 'visible', timeout: 10_000 })
-  await pathInput.fill(ctx.workspacePath)
-  await pathInput.press('Enter')
-  await pathInput.waitFor({ state: 'hidden', timeout: 30_000 })
-  await picker.getByRole('button', { name: 'Open', exact: true }).click({ timeout: 30_000 })
-  await picker.waitFor({ state: 'hidden', timeout: 30_000 })
-  return true
-}
-
-async function openSessionSurface(page) {
-  await dismissFirstRunOverlays(page)
-  // rc.5 冷启动自动初始化默认工作区并直接渲染 composer；优先等待它，
-  // 绝不主动点击会被已展开工作区菜单遮挡的 'Choose workspace' 按钮。
-  const composer = page.locator('[data-composer-input][contenteditable="true"]').first()
-  if (await composer.isVisible().catch(() => false)) return
-  try {
-    await composer.waitFor({ state: 'visible', timeout: 20_000 })
-    return
-  } catch (_) { /* fall through: sessionless hero */ }
-  await page.keyboard.press('Escape').catch(() => {})
-  if (await connectFreshWorkspaceThroughHero(page).catch(() => false)) {
-    await composer.waitFor({ state: 'visible', timeout: 20_000 })
-    return
-  }
-  const newSession = page.getByRole('button', { name: 'New session', exact: true }).last()
-  if (await newSession.isVisible().catch(() => false)) {
-    await newSession.click().catch(() => {})
-    try {
-      await composer.waitFor({ state: 'visible', timeout: 20_000 })
-      return
-    } catch (_) { /* fall through */ }
-  }
-  await dismissFirstRunOverlays(page)
-  const chooseWorkspace = page.getByRole('button', { name: 'Choose workspace', exact: true })
-  if (await chooseWorkspace.isVisible().catch(() => false)) {
-    await page.keyboard.press('Escape').catch(() => {})
-    const shown = (await chooseWorkspace.innerText().catch(() => '')).trim().toLowerCase()
-    if (shown !== 'workspace' && shown !== 'default workspace') {
-      await adoptRealWorkspace(page, ctx.workspacePath).catch(() => {})
-    }
-  }
-  await composer.waitFor({ state: 'visible', timeout: 15_000 })
-}
-
-async function ensureSessionView(page) {
-  if (await visionToggleCount(page) > 0) return
-  await page.reload({ waitUntil: 'domcontentloaded' })
-  await openSessionSurface(page)
-  const deadline = Date.now() + 30_000
-  while (Date.now() < deadline && await visionToggleCount(page) === 0) {
-    await page.waitForTimeout(500)
-  }
-}
-
 async function installThroughPage(page, spec) {
   const panel = await openPluginPanel(page)
   await panel.getByRole('button', { name: 'Add plugin', exact: true }).click()
@@ -236,13 +189,12 @@ async function installRefusalThroughPage(page, spec) {
   await alert.waitFor({ state: 'visible', timeout: 120_000 })
   const alertText = (await alert.textContent()) ?? ''
   const dialogText = (await dialog.textContent().catch(() => '')) ?? ''
-  const text = `${alertText}\n${dialogText}`
   ctx.hostOutput += `install refusal alert: ${alertText}\ninstall refusal dialog: ${dialogText.slice(0, 2_000)}\n`
   const closer = dialog.getByRole('button', { name: /^(Close|Done|Cancel)$/i }).first()
   if (await closer.count() > 0) await closer.click().catch(() => {})
   else await page.keyboard.press('Escape').catch(() => {})
   await dialog.waitFor({ state: 'detached', timeout: 10_000 }).catch(() => {})
-  return text
+  return `${alertText}\n${dialogText}`
 }
 
 async function installFailureThroughPage(page, spec) {
@@ -255,13 +207,12 @@ async function installFailureThroughPage(page, spec) {
   await alert.waitFor({ state: 'visible', timeout: 180_000 })
   const alertText = (await alert.textContent()) ?? ''
   const dialogText = (await dialog.textContent().catch(() => '')) ?? ''
-  const text = `${alertText}\n${dialogText}`
   ctx.hostOutput += `install failure alert: ${alertText}\ninstall failure dialog: ${dialogText.slice(0, 2_000)}\n`
   const closer = dialog.getByRole('button', { name: /^(Close|Done|Cancel)$/i }).first()
   if (await closer.count() > 0) await closer.click().catch(() => {})
   else await page.keyboard.press('Escape').catch(() => {})
   await dialog.waitFor({ state: 'detached', timeout: 10_000 }).catch(() => {})
-  return text
+  return `${alertText}\n${dialogText}`
 }
 
 async function uninstallThroughPage(page, name) {
@@ -303,7 +254,7 @@ function spawnCliInstall(spec) {
 }
 
 async function writeFixtureBundle(dir) {
-  await mkdirSync(dir, { recursive: true })
+  mkdirSync(dir, { recursive: true })
   await writeFile(join(dir, 'package.json'), `${JSON.stringify({
     name: BAD_BUNDLE_NAME,
     version: '0.0.0',
@@ -318,8 +269,8 @@ async function writeFixtureBundle(dir) {
 
 /**
  * 任务 A 合同的 e2e 实现：三态探测全部来自真实 Host（profile 文件、插件面板
- * 的 Host 投影、真实客户端页面的 /vision 面）。waitUntilReady 有界等待，
- * 超时显式返回 { ready: false, timedOut: true }。
+ * 的 Host 投影、Settings 的 Vision Router 客户端面）。waitUntilReady 有界
+ * 等待，超时显式返回 { ready: false, timedOut: true }。
  */
 function createReadinessAdapter({ target = DVR_NAME } = {}) {
   return {
@@ -329,11 +280,11 @@ function createReadinessAdapter({ target = DVR_NAME } = {}) {
       if (packageWritten) {
         hostApplied = await panelPackageCount(ctx.page, target) >= 1
       }
-      const clientAvailable = hostApplied && await visionToggleCount(ctx.page) > 0
+      const clientAvailable = hostApplied && await visionSurfaceCount(ctx.page) > 0
       return { states: { packageWritten, hostApplied, clientAvailable }, packageAlreadyPresent: packageWritten }
     },
     async checkCommandNameConflict() {
-      const observed = await visionToggleCount(ctx.page)
+      const observed = await visionSurfaceCount(ctx.page)
       return { conflict: observed > 1, observed }
     },
     async checkNativeAbi() {
@@ -350,29 +301,26 @@ function createReadinessAdapter({ target = DVR_NAME } = {}) {
           if (opened) states.hostApplied = await panelPackageCount(ctx.page, target) >= 1
         }
         if (states.hostApplied && !states.clientAvailable) {
-          if (Date.now() - lastReload >= 5_000) {
+          // 客户端面以一次整页重载后的 Settings 分区为准；重载限频 30s。
+          if (Date.now() - lastReload >= 30_000) {
             lastReload = Date.now()
             try {
               await ctx.page.reload({ waitUntil: 'domcontentloaded' })
-              await openSessionSurface(ctx.page)
-              // 重载后给客户端留一个有界沉降窗口，避免下轮立刻再整页重载。
-              const settleDeadline = Date.now() + 10_000
-              while (Date.now() < settleDeadline) {
-                if (await visionToggleCount(ctx.page) > 0) break
-                await ctx.page.waitForTimeout(500)
-              }
-              states.clientAvailable = await visionToggleCount(ctx.page) > 0
+              await dismissFirstRunOverlays(ctx.page)
             } catch (navigationError) {
-              ctx.hostOutput += `waitUntilReady clientAvailable probe error: ${navigationError instanceof Error ? navigationError.message : String(navigationError)}\n`
+              ctx.hostOutput += `waitUntilReady client reload error: ${navigationError instanceof Error ? navigationError.message : String(navigationError)}\n`
             }
-          } else {
-            await ctx.page.waitForTimeout(1_000)
+          }
+          try {
+            states.clientAvailable = await visionSurfaceCount(ctx.page) > 0
+          } catch (probeError) {
+            ctx.hostOutput += `waitUntilReady clientAvailable probe error: ${probeError instanceof Error ? probeError.message : String(probeError)}\n`
           }
         }
         if (states.packageWritten && states.hostApplied && states.clientAvailable) {
           return { ready: true, timedOut: false, states }
         }
-        if (!states.packageWritten) await ctx.page.waitForTimeout(1_000)
+        await ctx.page.waitForTimeout(1_000)
       }
       return { ready: false, timedOut: true, states }
     },
@@ -390,8 +338,7 @@ function createProbeAdapter({ restoreAgainst = BAD_BUNDLE_NAME } = {}) {
   }
   return {
     async visionStatus() {
-      await ensureSessionView(ctx.page)
-      const discoverable = await visionToggleCount(ctx.page) > 0
+      const discoverable = await visionSurfaceCount(ctx.page) > 0
       return {
         ok: discoverable && ctx.modelRequestCount === 0,
         discoverable,
@@ -399,12 +346,12 @@ function createProbeAdapter({ restoreAgainst = BAD_BUNDLE_NAME } = {}) {
       }
     },
     async surfaceCounts() {
-      await ensureSessionView(ctx.page)
-      const commands = await visionToggleCount(ctx.page)
-      const settingsCards = commands
+      // commands/routes/settingsCards 取 Settings 的 Vision Router 一级分区
+      // （/vision 命令与设置的客户端面）；tools 取插件面板的包行。
+      const navCount = await visionSurfaceCount(ctx.page)
       await openPluginPanel(ctx.page)
       const packageRow = await panelPackageCount(ctx.page, DVR_NAME)
-      const counts = { commands, tools: packageRow, routes: packageRow, settingsCards }
+      const counts = { commands: navCount, tools: packageRow, routes: navCount, settingsCards: navCount }
       const unique = ['commands', 'tools', 'routes', 'settingsCards'].every((key) => counts[key] === 1)
       return { ok: unique, counts }
     },
@@ -443,8 +390,7 @@ async function assertPackageRowCount(name, expected, label) {
 }
 
 async function assertVisionSurfaceCount(expected, label) {
-  await ensureSessionView(ctx.page)
-  assert.equal(await visionToggleCount(ctx.page), expected, `${label}: /vision surface count`)
+  assert.equal(await visionSurfaceCount(ctx.page), expected, `${label}: /vision settings surface count`)
 }
 
 test('real DSH 0.2.1-rc.5 Host boots cold with no DVR plugin installed', { timeout: 240_000 }, async (t) => {
@@ -455,8 +401,6 @@ test('real DSH 0.2.1-rc.5 Host boots cold with no DVR plugin installed', { timeo
 
   const scratch = mkdtempSync(join(tmpdir(), 'dvr-hot-install-e2e-'))
   ctx.scratch = scratch
-  ctx.workspacePath = join(scratch, 'workspace')
-  mkdirSync(ctx.workspacePath)
   ctx.env = {
     ...process.env,
     DSH_HOME: join(scratch, '.dsh'),
@@ -488,10 +432,10 @@ test('real DSH 0.2.1-rc.5 Host boots cold with no DVR plugin installed', { timeo
     ctx.hostOutput += `pageerror: ${error.message}\n`
   })
   await ctx.page.goto(readyUrl)
+  await dismissFirstRunOverlays(ctx.page)
 
-  await openSessionSurface(ctx.page)
-  // Cold: no DVR surface, no manifest entry.
-  assert.equal(await visionToggleCount(ctx.page), 0, 'cold host must expose no /vision surface')
+  // Cold: no /vision client surface, no manifest entry.
+  assert.equal(await visionSurfaceCount(ctx.page), 0, 'cold host must expose no /vision settings surface')
   assert.equal(manifestReferences(DVR_NAME), false, 'cold profile manifest must not reference DVR')
   assertHostNeverRestarted('cold boot')
 })
@@ -580,8 +524,8 @@ test('external CLI channel: manifest watcher hot-applies the reinstall without p
   await uninstallThroughPage(ctx.page, DVR_NAME)
   assert.equal(manifestReferences(DVR_NAME), false, 'uninstall must clear the profile dependency')
   await ctx.page.reload({ waitUntil: 'domcontentloaded' })
-  await openSessionSurface(ctx.page)
-  assert.equal(await visionToggleCount(ctx.page), 0, 'vision surface must leave with the uninstalled plugin')
+  await dismissFirstRunOverlays(ctx.page)
+  assert.equal(await visionSurfaceCount(ctx.page), 0, 'vision surface must leave with the uninstalled plugin')
 
   const transaction = createFirstInstallTransaction({
     spec: dvrSpec,
